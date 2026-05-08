@@ -4,6 +4,7 @@ import math
 import re
 import time
 from uuid import uuid4
+from pathlib import Path
 from datetime import datetime, time as dt_time
 from collections import defaultdict
 from typing import Any, Callable, Dict, List, Tuple
@@ -251,25 +252,26 @@ Repeatable decision principles:
 
 These principles should shape every response consistently."""
 
-# Estimated token count: ~1320 (intentionally >1024 for Anthropic prompt cache threshold).
+# Estimated token count: ~1160 (intentionally >1024 for Anthropic prompt cache threshold).
 HAIKU_STOCK_WEB_RESEARCH_SYSTEM = """You are a web-research retriever for a single stock.
-Use the web_search tool to gather high-signal, recent, and decision-relevant context.
+Use the web_search tool exactly once per API call.
 
 INPUTS PROVIDED IN USER MESSAGE
 - ticker
 - sector
-You must infer query phrasing and run multiple searches yourself.
+- query
 
-SEARCH STRATEGY
-Cover these topic families:
-1) official filings and disclosures
-2) earnings calls, guidance, and revisions
-3) institutional ownership / 13F style context
-4) credible analyst commentary and target revisions
-5) valuation context and peer comparisons
-6) macro + sector conditions impacting forward results
-7) options/short-interest sentiment context
-8) recent material events, legal/regulatory updates
+STRICT EXECUTION RULES
+- Run exactly one web_search call using the provided query text.
+- Do not generate additional queries.
+- Do not run multiple searches.
+- Do not broaden scope beyond the provided query.
+- Do not call web_search more than once.
+
+OUTPUT BEHAVIOR
+- Keep final assistant text minimal (one short acknowledgement).
+- Retrieved tool results are what downstream pipeline consumes.
+- Do not provide long narrative analysis in this step.
 
 SOURCE PRIORITY
 Prioritize domains typically mapped to:
@@ -278,40 +280,15 @@ Prioritize domains typically mapped to:
 - tier_3: CNBC/MarketWatch/Yahoo Finance class sources
 Avoid social chatter, forums, and unverified rumor sources.
 
-OUTPUT BEHAVIOR
-- Run web_search calls first.
-- Keep final assistant text minimal (one short acknowledgement).
-- Retrieved tool results are what downstream pipeline consumes.
-- Do not provide long narrative analysis in this step.
-
 QUALITY BAR
 - Favor recency and specificity.
-- Include multiple perspectives when possible.
-- Reduce duplicate-domain overconcentration.
 - Prefer concrete signals (figures, guidance, filings) to vague opinions.
-- Keep searches relevant to investor decision making.
-
-Detailed retrieval checklist:
-- Find at least one filing/disclosure-oriented result when available.
-- Find at least one earnings/guidance item when available.
-- Find at least one institutional positioning angle when available.
-- Find at least one valuation/peer context item when available.
-- Find at least one macro/sector context item when available.
-- Find at least one sentiment/options/short-interest context item when available.
-- Balance bullish and bearish evidence.
-- Avoid repeating equivalent searches that produce near-identical result sets.
-- Prefer reputable domains with clear attribution.
-- Avoid stale content unless historical context is required.
+- Keep retrieval relevant to investor decision making.
+- Never hallucinate search results; rely on tool output only.
 
 Implementation discipline:
-- Use concise but precise search terms with ticker symbol.
-- Add sector terms to disambiguate broad tickers.
-- Include current year markers where useful.
-- Use terms like "guidance", "outlook", "filing", "transcript", "13F", "price target",
-  "short interest", and "implied volatility" where relevant.
-- Keep retrieval broad enough to capture unknown risks.
-- Never hallucinate search results; rely on tool output only.
-- Keep response format stable across runs to maximize deterministic downstream behavior.
+- Use the exact query string from user input.
+- Keep behavior deterministic across runs for consistent downstream processing.
 
 This instruction block is intentionally verbose for prompt caching and consistency."""
 
@@ -496,11 +473,13 @@ WEIGHT_SLIDER_DEFINITIONS: List[tuple[str, str]] = [
 ]
 
 HAIKU_PORTFOLIO_WEB_RESEARCH_MAX_TOKENS = 8192
-HAIKU_SINGLE_WEB_SEARCH_MAX_TOKENS = 6144
+HAIKU_SINGLE_WEB_SEARCH_MAX_TOKENS = 2048
 HAIKU_SEARCH_HIT_SUMMARY_MAX_TOKENS = 4000
 MAX_WEB_SEARCH_HITS_PER_ROUND = 20
 MAX_SUMMARIES_PER_TARGETED_QUERY = 5
 MAX_PORTFOLIO_SEARCH_HITS_TO_SUMMARIZE = 15
+MAX_HAIKU_WEB_SEARCH_CALLS_PER_STOCK = 12
+DEBUG_LOG_FILE = Path(__file__).resolve().parent / "debug_log.txt"
 
 
 
@@ -811,8 +790,12 @@ def build_web_research_summaries_for_stock(
     """Stock web research retrieval + tier-batched summarization."""
     collected_hits: List[Dict[str, Any]] = []
     ctx = f"Targeted diligence for {ticker.upper()}"
+    search_calls_made = 0
     for query in stock_targeted_search_queries(ticker, sector, market_cap):
+        if search_calls_made >= MAX_HAIKU_WEB_SEARCH_CALLS_PER_STOCK:
+            break
         hits = haiku_web_search_for_stock(client, ticker, sector, query)
+        search_calls_made += 1
         tier3_count = 0
         other_count = 0
         for h in hits:
@@ -843,6 +826,11 @@ def build_web_research_summaries_for_stock(
                 tier3_count += 1
             elif tier == "tier_other":
                 other_count += 1
+    print(
+        f"[Haiku Search] {ticker.upper()} completed {search_calls_made} web_search calls "
+        f"(cap={MAX_HAIKU_WEB_SEARCH_CALLS_PER_STOCK}).",
+        flush=True,
+    )
     out: List[Dict[str, Any]] = []
     for tier in ["tier_1", "tier_2", "tier_3", "tier_other"]:
         tier_hits = [h for h in collected_hits if h.get("source_tier") == tier]
@@ -945,19 +933,67 @@ def _claude_debug_payload_enabled() -> bool:
         return False
 
 
+def _append_debug_log_line(line: str) -> None:
+    try:
+        with DEBUG_LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        return
+
+
+def _ensure_debug_run_header() -> None:
+    key = "_debug_log_run_header_written"
+    try:
+        already_written = bool(st.session_state.get(key))
+    except Exception:
+        already_written = False
+    if already_written:
+        return
+    ts = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M:%S %Z")
+    _append_debug_log_line("")
+    _append_debug_log_line(f"=== Claude debug run started: {ts} ===")
+    try:
+        st.session_state[key] = True
+    except Exception:
+        return
+
+
+def _count_web_search_results(response: Any) -> int:
+    count = 0
+    for block in getattr(response, "content", []) or []:
+        if getattr(block, "type", None) != "web_search_tool_result":
+            continue
+        inner = getattr(block, "content", None)
+        if not isinstance(inner, list):
+            continue
+        for item in inner:
+            if getattr(item, "type", None) == "web_search_result":
+                count += 1
+    return count
+
+
 def anthropic_messages_create(client: Anthropic, **kwargs: Any) -> Any:
     """Call Messages API with retries for throttling/server faults."""
-    if _claude_debug_payload_enabled():
+    debug_enabled = _claude_debug_payload_enabled()
+    payload_repr = ""
+    model = kwargs.get("model", "?")
+    if debug_enabled:
+        _ensure_debug_run_header()
         payload_repr = json.dumps(kwargs, default=str, sort_keys=True)
-        model = kwargs.get("model", "?")
-        print(
-            f"[Claude API debug] model={model} payload_character_count={len(payload_repr)}",
-            flush=True,
-        )
     max_attempts = max(ANTHROPIC_429_MAX_RETRIES, ANTHROPIC_500_MAX_RETRIES) + 1
     for attempt in range(max_attempts):
         try:
-            return client.messages.create(**kwargs)
+            response = client.messages.create(**kwargs)
+            if debug_enabled:
+                search_count = _count_web_search_results(response)
+                debug_line = (
+                    f"[Claude API debug] model={model} "
+                    f"payload_character_count={len(payload_repr)} "
+                    f"search_count={search_count}"
+                )
+                print(debug_line, flush=True)
+                _append_debug_log_line(debug_line)
+            return response
         except APIStatusError as e:
             status_code = getattr(e, "status_code", None)
             if status_code == 429:
