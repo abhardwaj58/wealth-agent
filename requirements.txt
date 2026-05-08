@@ -1,0 +1,6 @@
+streamlit
+yfinance
+anthropic
+pandas
+httpx
+schedule
