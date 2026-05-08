@@ -497,7 +497,7 @@ WEIGHT_SLIDER_DEFINITIONS: List[tuple[str, str]] = [
 
 HAIKU_PORTFOLIO_WEB_RESEARCH_MAX_TOKENS = 8192
 HAIKU_SINGLE_WEB_SEARCH_MAX_TOKENS = 6144
-HAIKU_SEARCH_HIT_SUMMARY_MAX_TOKENS = 900
+HAIKU_SEARCH_HIT_SUMMARY_MAX_TOKENS = 4000
 MAX_WEB_SEARCH_HITS_PER_ROUND = 20
 MAX_SUMMARIES_PER_TARGETED_QUERY = 5
 MAX_PORTFOLIO_SEARCH_HITS_TO_SUMMARIZE = 15
@@ -561,23 +561,55 @@ def classify_search_source(url: str) -> tuple[str, float]:
     return "tier_other", 0.55
 
 
-def stock_targeted_search_queries(ticker: str, sector: str | None) -> List[str]:
-    sect = sector or "Unknown sector"
+def stock_targeted_search_queries(
+    ticker: str,
+    sector: str | None,
+    market_cap: float | None,
+) -> List[str]:
+    _ = sector or "Unknown sector"
     t = ticker.strip().upper()
-    return [
-        f"{t} SEC EDGAR 10-K 10-Q latest filing",
-        f"{t} earnings call transcript Q1 2026",
-        f"{t} 8-K material events 2026",
-        f"{t} 13F institutional holdings BlackRock Vanguard Berkshire 2026",
-        f"{t} Goldman Sachs Morgan Stanley analyst rating 2026",
-        f"{t} JPMorgan BofA Barclays price target 2026",
-        f"{t} Bloomberg revenue outlook 2026",
-        f"{t} Wall Street Journal business strategy 2026",
-        f"{t} Financial Times competitive landscape 2026",
-        f"{t} Reuters earnings guidance 2026",
-        f"{t} insider buying selling SEC Form 4 2026",
-        f"{t} sector macro outlook {sect} 2026",
+    cap = _as_float(market_cap)
+
+    large_cap_queries = [
+        f"{t} SEC EDGAR 10-K latest filing",
+        f"{t} SEC EDGAR latest 10-Q filing",
+        f"{t} SEC EDGAR latest 8-K material events",
+        f"{t} earnings call transcript latest quarter",
+        f"{t} earnings guidance management commentary latest",
+        f"{t} Goldman Sachs Morgan Stanley analyst rating latest",
+        f"{t} JPMorgan BofA Barclays price target latest",
+        f"{t} 13F institutional holdings latest quarter",
+        f"{t} BlackRock Vanguard 13F position latest",
+        f"{t} insider buying selling SEC Form 4 latest",
+        f"{t} Bloomberg company news latest",
+        f"{t} Reuters company news latest",
     ]
+
+    mid_cap_queries = [
+        f"{t} SEC EDGAR 10-K latest filing",
+        f"{t} SEC EDGAR latest 10-Q filing",
+        f"{t} earnings call transcript latest quarter",
+        f"{t} earnings guidance management commentary latest",
+        f"{t} Goldman Sachs Morgan Stanley analyst rating latest",
+        f"{t} JPMorgan BofA Barclays price target latest",
+        f"{t} insider buying selling SEC Form 4 latest",
+        f"{t} Reuters company news latest",
+    ]
+
+    small_cap_queries = [
+        f"{t} SEC EDGAR 10-K latest filing",
+        f"{t} SEC EDGAR latest 10-Q filing",
+        f"{t} earnings call transcript latest quarter",
+        f"{t} earnings guidance management commentary latest",
+        f"{t} analyst rating latest",
+        f"{t} analyst price target latest",
+    ]
+
+    if cap is not None and cap < 5_000_000_000:
+        return small_cap_queries
+    if cap is not None and cap < 10_000_000_000:
+        return mid_cap_queries
+    return large_cap_queries
 
 
 def extract_web_search_hits_from_response(response: Any) -> List[Dict[str, Any]]:
@@ -698,7 +730,14 @@ def haiku_summarize_search_hits_for_tier(
         messages=[{"role": "user", "content": user_msg}],
     )
     text = "".join(c.text for c in r.content if c.type == "text").strip()
-    parsed = extract_json_from_text(text)
+    try:
+        parsed = extract_json_from_text(text)
+    except Exception as e:
+        print(
+            f"[WARN] Failed to parse Haiku tier batch summaries for tier={source_tier}: {e}",
+            flush=True,
+        )
+        return [{"hit_id": i, "summary": ""} for i, _ in enumerate(hits)]
     if isinstance(parsed, dict):
         summaries = parsed.get("summaries")
         if isinstance(summaries, list):
@@ -716,11 +755,20 @@ def haiku_summarize_search_hits_for_tier(
             if out:
                 return out
     # Fallback: keep the run resilient even if model output is malformed.
-    return [{"hit_id": i, "summary": "Summary unavailable for this source."} for i, _ in enumerate(hits)]
+    print(
+        f"[WARN] Haiku tier batch summaries malformed for tier={source_tier}; returning empty summaries.",
+        flush=True,
+    )
+    return [{"hit_id": i, "summary": ""} for i, _ in enumerate(hits)]
 
 
-def haiku_web_search_for_stock(client: Anthropic, ticker: str, sector: str | None) -> List[Dict[str, Any]]:
-    """One Haiku+web_search retrieval call for a stock context."""
+def haiku_web_search_for_stock(
+    client: Anthropic,
+    ticker: str,
+    sector: str | None,
+    query: str,
+) -> List[Dict[str, Any]]:
+    """One Haiku+web_search retrieval call for a single targeted stock query."""
     sector_text = (sector or "Unknown").strip() or "Unknown"
     research = anthropic_messages_create(
         client,
@@ -735,6 +783,7 @@ def haiku_web_search_for_stock(client: Anthropic, ticker: str, sector: str | Non
                     {
                         "ticker": ticker.strip().upper(),
                         "sector": sector_text,
+                        "query": query,
                     },
                     default=str,
                 ),
@@ -757,42 +806,43 @@ def sentence_targets_for_source_weight(source_weight: float) -> tuple[int, int]:
 
 
 def build_web_research_summaries_for_stock(
-    client: Anthropic, ticker: str, sector: str | None
+    client: Anthropic, ticker: str, sector: str | None, market_cap: float | None
 ) -> List[Dict[str, Any]]:
     """Stock web research retrieval + tier-batched summarization."""
     collected_hits: List[Dict[str, Any]] = []
     ctx = f"Targeted diligence for {ticker.upper()}"
-    hits = haiku_web_search_for_stock(client, ticker, sector)
-    tier3_count = 0
-    other_count = 0
-    for h in hits:
-        url = h.get("url") or ""
-        tier, weight = classify_search_source(url)
-        if tier == "blocked" or weight <= 0:
-            continue
-
-        if tier == "tier_3":
-            if tier3_count >= 3:
-                continue
-        elif tier == "tier_other":
-            if other_count >= 3:
+    for query in stock_targeted_search_queries(ticker, sector, market_cap):
+        hits = haiku_web_search_for_stock(client, ticker, sector, query)
+        tier3_count = 0
+        other_count = 0
+        for h in hits:
+            url = h.get("url") or ""
+            tier, weight = classify_search_source(url)
+            if tier == "blocked" or weight <= 0:
                 continue
 
-        collected_hits.append(
-            {
-                "search_query": f"{ticker.upper()} broad_research",
-                "title": h.get("title"),
-                "url": url,
-                "page_age": h.get("page_age"),
-                "encrypted_content": h.get("encrypted_content"),
-                "source_tier": tier,
-                "source_weight": weight,
-            }
-        )
-        if tier == "tier_3":
-            tier3_count += 1
-        elif tier == "tier_other":
-            other_count += 1
+            if tier == "tier_3":
+                if tier3_count >= 3:
+                    continue
+            elif tier == "tier_other":
+                if other_count >= 3:
+                    continue
+
+            collected_hits.append(
+                {
+                    "search_query": query,
+                    "title": h.get("title"),
+                    "url": url,
+                    "page_age": h.get("page_age"),
+                    "encrypted_content": h.get("encrypted_content"),
+                    "source_tier": tier,
+                    "source_weight": weight,
+                }
+            )
+            if tier == "tier_3":
+                tier3_count += 1
+            elif tier == "tier_other":
+                other_count += 1
     out: List[Dict[str, Any]] = []
     for tier in ["tier_1", "tier_2", "tier_3", "tier_other"]:
         tier_hits = [h for h in collected_hits if h.get("source_tier") == tier]
@@ -1240,26 +1290,63 @@ def get_stock_raw_data(yf_symbol: str, *, display_ticker: str | None = None) -> 
 
     # Summarize analyst recommendations (Yahoo Finance analyst data via yfinance)
     rec_summary = {"buy": 0, "hold": 0, "sell": 0, "sources": []}
-    if isinstance(recommendations, pd.DataFrame) and not recommendations.empty:
-        latest = recommendations.tail(60).copy()
+    if _claude_debug_payload_enabled():
+        rec_cols = (
+            list(recommendations.columns)
+            if isinstance(recommendations, pd.DataFrame)
+            else []
+        )
+        up_cols = list(upgrades.columns) if isinstance(upgrades, pd.DataFrame) else []
+        print(f"[DEBUG] {label} tk.recommendations columns: {rec_cols}", flush=True)
+        print(f"[DEBUG] {label} tk.upgrades_downgrades columns: {up_cols}", flush=True)
+
+    def _extract_grade_text(row: pd.Series) -> str:
+        # yfinance schema varies by endpoint/version.
+        for key in ("To Grade", "toGrade", "Action"):
+            raw = row.get(key)
+            if raw is not None and not (isinstance(raw, float) and pd.isna(raw)):
+                return str(raw).lower().strip()
+        return ""
+
+    def _summarize_analyst_df(df: pd.DataFrame, *, max_rows: int = 60) -> Dict[str, Any]:
+        out = {"buy": 0, "hold": 0, "sell": 0, "sources": []}
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return out
+        latest = df.tail(max_rows).copy()
         for _, row in latest.iterrows():
-            # yfinance schema varies by version: "To Grade" vs "toGrade"
-            raw_grade = row.get("To Grade")
-            if raw_grade is None or (isinstance(raw_grade, float) and pd.isna(raw_grade)):
-                raw_grade = row.get("toGrade")
-            to_grade = str(raw_grade or "").lower()
+            grade_text = _extract_grade_text(row)
             firm = str(row.get("Firm", "")).strip()
-            if any(x in to_grade for x in ["buy", "overweight", "outperform", "strong buy"]):
-                rec_summary["buy"] += 1
-            elif any(x in to_grade for x in ["hold", "neutral", "market perform", "equal weight"]):
-                rec_summary["hold"] += 1
-            elif any(x in to_grade for x in ["sell", "underperform", "underweight"]):
-                rec_summary["sell"] += 1
+            if any(x in grade_text for x in ["buy", "overweight", "outperform", "strong buy", "upgrade", "up"]):
+                out["buy"] += 1
+            elif any(x in grade_text for x in ["hold", "neutral", "market perform", "equal weight", "maintain"]):
+                out["hold"] += 1
+            elif any(x in grade_text for x in ["sell", "underperform", "underweight", "downgrade", "down"]):
+                out["sell"] += 1
             if firm:
-                rec_summary["sources"].append(firm)
-    if isinstance(upgrades, pd.DataFrame) and not upgrades.empty:
-        if "Firm" in upgrades.columns:
-            rec_summary["sources"].extend(upgrades["Firm"].dropna().astype(str).tolist())
+                out["sources"].append(firm)
+        return out
+
+    rec_from_recommendations = _summarize_analyst_df(recommendations, max_rows=60)
+    rec_from_upgrades = _summarize_analyst_df(upgrades, max_rows=120)
+
+    total_recs = (
+        rec_from_recommendations["buy"]
+        + rec_from_recommendations["hold"]
+        + rec_from_recommendations["sell"]
+    )
+    total_upgrades = (
+        rec_from_upgrades["buy"]
+        + rec_from_upgrades["hold"]
+        + rec_from_upgrades["sell"]
+    )
+
+    chosen = rec_from_recommendations if total_recs > 0 else rec_from_upgrades
+    rec_summary["buy"] = int(chosen["buy"])
+    rec_summary["hold"] = int(chosen["hold"])
+    rec_summary["sell"] = int(chosen["sell"])
+    rec_summary["sources"].extend(chosen["sources"])
+    if isinstance(upgrades, pd.DataFrame) and not upgrades.empty and "Firm" in upgrades.columns:
+        rec_summary["sources"].extend(upgrades["Firm"].dropna().astype(str).tolist())
 
     # Fallback: use analyst_price_targets when recommendation grades are unavailable/empty.
     # Some yfinance versions expose sentiment-style counts here (buy/hold/sell, strongBuy/strongSell).
@@ -1349,6 +1436,27 @@ def fmt_two_dec(value: Any, *, prefix: str = "", suffix: str = "") -> str:
         return f"{prefix}{x:.2f}{suffix}"
     except (TypeError, ValueError):
         return "—"
+
+
+def fmt_human_money(value: Any) -> str:
+    """Format large currency values using T/B/M suffixes."""
+    if value is None:
+        return "—"
+    try:
+        x = float(value)
+        if math.isnan(x):
+            return "—"
+    except (TypeError, ValueError):
+        return "—"
+    sign = "-" if x < 0 else ""
+    ax = abs(x)
+    if ax >= 1_000_000_000_000:
+        return f"{sign}${ax / 1_000_000_000_000:.1f}T"
+    if ax >= 1_000_000_000:
+        return f"{sign}${ax / 1_000_000_000:.1f}B"
+    if ax >= 1_000_000:
+        return f"{sign}${ax / 1_000_000:.1f}M"
+    return f"{sign}${ax:.2f}"
 
 
 def _iv_as_decimal(iv: float | None) -> float | None:
@@ -1475,11 +1583,12 @@ def analyze_with_sonnet(
     data = normalized_payload_for_sonnet(normalized_payload)
     ticker = str(data.get("ticker") or normalized_payload.get("ticker") or "")
     sector = (normalized_payload.get("price_snapshot") or {}).get("sector")
+    market_cap = (normalized_payload.get("price_snapshot") or {}).get("market_cap")
     inst = normalized_payload.get("institutional_positioning") or {
         "top_institutional_holders": [],
         "major_holders": [],
     }
-    summaries = build_web_research_summaries_for_stock(client, ticker, sector)
+    summaries = build_web_research_summaries_for_stock(client, ticker, sector, market_cap)
 
     user_payload = {
         "holding_quantity": quantity,
@@ -1860,21 +1969,38 @@ def run_app():
         st.session_state["_scheduled_job_time"] = None
     schedule.run_pending()
 
+    def _sync_holdings_editor_from_manual_input() -> None:
+        parsed = parse_manual_holdings(st.session_state.get("manual_holdings_input", ""))
+        st.session_state["manual_holdings_parsed_rows"] = (
+            parsed if parsed else [{"ticker": "", "quantity": 0.0}]
+        )
+        st.session_state["holdings_editor_version"] = int(
+            st.session_state.get("holdings_editor_version", 0)
+        ) + 1
+
     staged_manual_holdings = st.session_state.pop("manual_holdings_input_staged", None)
     if staged_manual_holdings is not None:
         st.session_state["manual_holdings_input"] = staged_manual_holdings
+        _sync_holdings_editor_from_manual_input()
 
     if "manual_holdings_input" not in st.session_state:
         loaded_holdings = load_saved_portfolio(sb_client, user_id)
         st.session_state["manual_holdings_input"] = format_holdings_as_manual_input(loaded_holdings)
+    if "manual_holdings_parsed_rows" not in st.session_state:
+        _sync_holdings_editor_from_manual_input()
 
     st.subheader("Portfolio Input")
     st.text_area(
         "Manual input (format: TICKER:QTY, TICKER:QTY)",
         placeholder="AAPL:12, MSFT:8, NVDA:5",
         key="manual_holdings_input",
+        on_change=_sync_holdings_editor_from_manual_input,
     )
-    parsed_live = parse_manual_holdings(st.session_state.get("manual_holdings_input", ""))
+    apply_col, _ = st.columns([1, 6])
+    with apply_col:
+        if st.button("✔ Apply", key="apply_manual_holdings_input"):
+            _sync_holdings_editor_from_manual_input()
+            st.rerun()
     uploaded = st.file_uploader("Or upload brokerage screenshot", type=["png", "jpg", "jpeg", "webp"])
 
     if st.button("Extract holdings from screenshot"):
@@ -1888,8 +2014,9 @@ def run_app():
                 st.rerun()
 
     st.write("Confirm or edit holdings before analysis (updates from the text field as you type):")
-    edit_df = pd.DataFrame(parsed_live if parsed_live else [{"ticker": "", "quantity": 0}])
-    edited = st.data_editor(edit_df, num_rows="dynamic", use_container_width=True, key="holdings_editor")
+    edit_df = pd.DataFrame(st.session_state.get("manual_holdings_parsed_rows") or [{"ticker": "", "quantity": 0.0}])
+    editor_key = f"holdings_editor_v{int(st.session_state.get('holdings_editor_version', 0))}"
+    edited = st.data_editor(edit_df, num_rows="dynamic", use_container_width=True, key=editor_key)
     holdings = []
     for _, row in edited.iterrows():
         ticker = str(row.get("ticker", "")).upper().strip()
@@ -2067,7 +2194,7 @@ def run_app():
             px = normalized.get("price_snapshot", {})
             c1, c2, c3 = st.columns(3)
             c1.metric("Current Price", fmt_two_dec(px.get("current_price"), prefix="$"))
-            c2.metric("Market Cap", fmt_two_dec(px.get("market_cap"), prefix="$"))
+            c2.metric("Market Cap", fmt_human_money(px.get("market_cap")))
             c3.metric("Sector", px.get("sector") or "N/A")
 
             c4, c5, c6 = st.columns(3)
@@ -2114,6 +2241,9 @@ def run_app():
                     except (TypeError, ValueError):
                         cp_s = "—"
                     st.metric("Confidence", cp_s)
+                    st.caption(
+                        "Confidence reflects strength of available evidence supporting this stance, not a price prediction."
+                    )
                     sup = stance.get("supporting_institutions") or []
                     if isinstance(sup, list) and sup:
                         st.caption("Supporting institutions / firms: " + ", ".join(map(str, sup)))
@@ -2203,6 +2333,9 @@ def run_app():
             st.markdown(interpret_call_put_oi_ratio(cp_ratio))
 
             st.markdown("**Implied volatility (nearest expiry chain)**")
+            st.caption(
+                "IV measures the market's expectation of future price swings. Higher IV means larger expected moves in either direction."
+            )
             st.markdown(interpret_implied_volatility(iv_raw))
 
             st.markdown("**Nearest options expiry**")
