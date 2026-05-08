@@ -3,9 +3,10 @@ import json
 import math
 import re
 import time
+from uuid import uuid4
 from datetime import datetime, time as dt_time
 from collections import defaultdict
-from typing import Any, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
@@ -19,95 +20,448 @@ from supabase_memory import (
     get_or_create_user_id,
     get_supabase_client_singleton,
     load_saved_portfolio,
-    save_portfolio_run,
+    upsert_portfolio_run_snapshot,
 )
 
 
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 SONNET_MODEL = "claude-sonnet-4-20250514"
 
-# Static Sonnet instructions + JSON schemas (prompt caching: same bytes → cache hit across holdings in one run).
-SONNET_STOCK_ANALYSIS_SYSTEM = """You are an equity research assistant analyzing ONE symbol per user message.
+# Estimated token count: ~1500 (intentionally >1024 for Anthropic prompt cache threshold).
+SONNET_STOCK_ANALYSIS_SYSTEM = """You are a senior equity research and portfolio recommendation assistant.
+You analyze exactly one symbol per request, using only structured JSON user input.
 
-INPUT JSON keys you may rely on:
-- scoring_weights: decimal weights summing to 1.0 for:
+PRIMARY OBJECTIVE
+Produce a transparent institutional-style assessment with balanced bull/bear/hold framing,
+factor-by-factor scoring on a 0-10 scale, and an action recommendation derived from weighted
+composite scoring.
+
+DATA CONTRACT
+User input includes:
+- holding_quantity
+- scoring_weights with six decimal weights that sum to 1.0:
   analyst_consensus, institutional_positioning, forward_revenue_visibility,
   valuation_vs_historical_pe, macro_and_sector_factors, options_and_short_interest
-- holding_quantity, data (normalized market/analyst/options fields), institutional_positioning (from yfinance),
-- web_research_summaries (list of Haiku summaries with title, url, summary, search_query; trust higher source_weight),
+- data object with normalized market, fundamentals, and analyst fields
+- institutional_positioning data
+- web_research_summaries list of source summaries. Each summary may include source_tier and source_weight.
 
-You cannot use web_search or browse; only those JSON keys exist.
+HARD CONSTRAINTS
+- You cannot browse or use tools.
+- You cannot invent data not inferable from user payload.
+- If data is missing, acknowledge uncertainty and degrade confidence.
+- Output must be strict JSON only (no markdown, no prose wrapper).
 
-Produce strict JSON only (no markdown fences).
+SOURCE CREDIBILITY WEIGHTING
+- tier_1 / source_weight near 1.0: filings and highest-credibility context; prioritize strongly.
+- tier_2 / source_weight near 0.8: high-quality business press and institutional commentary; use heavily.
+- tier_3 / source_weight near 0.6: mainstream financial media; use moderately.
+- tier_other / source_weight near 0.55: supportive context only; do not over-weight.
+- Conflicting claims: prefer higher credibility and more recent context.
+- Do not overfit to any single source. Combine with structured market/fundamental signals.
 
-OUTPUT SCHEMA:
+SCORING RUBRIC OVERVIEW
+Score every factor from 0.0 to 10.0.
+Anchor interpretation:
+- 0-2: materially negative
+- 3-4: weak
+- 5-6: neutral/mixed
+- 7-8: constructive
+- 9-10: exceptional
+Avoid extreme scores unless evidence is strong and multi-sourced.
+
+FACTOR 1: analyst_score (analyst_consensus)
+- Inputs: buy/hold/sell counts, trend indications, reputable research commentary.
+- Higher when analyst stance is consistently constructive with coherent rationale.
+- Lower when downgrades dominate, revisions trend negative, or outlook uncertainty rises.
+
+FACTOR 2: institutional_score (institutional_positioning)
+- Inputs: top holders, ownership stability, concentration among sophisticated funds.
+- Higher with stable/high-quality institutional sponsorship and positive ownership trends.
+- Lower with sharp ownership deterioration, weak sponsorship, or churn concerns.
+
+FACTOR 3: revenue_score (forward_revenue_visibility)
+- Inputs: guidance quality, demand durability, backlog/order visibility, catalyst clarity.
+- Higher when forward growth path has credible, specific support.
+- Lower when revenue outlook is opaque, cyclically fragile, or heavily assumption-driven.
+
+FACTOR 4: valuation_score (valuation_vs_historical_pe)
+- Inputs: current valuation versus own history/sector context, growth quality, risk premium.
+- Higher when valuation is attractive relative to quality and growth durability.
+- Lower when valuation is stretched without commensurate quality/visibility.
+
+FACTOR 5: macro_score (macro_and_sector_factors)
+- Inputs: rate backdrop, inflation sensitivity, commodity/fx effects, sector cycle.
+- Higher when macro and sector regime support earnings resilience.
+- Lower when top-down regime likely compresses multiples or margins.
+
+FACTOR 6: options_score (options_and_short_interest)
+- Inputs: call/put open-interest ratio, implied volatility context, short-interest pressure.
+- Higher when positioning and sentiment imply constructive skew without complacency.
+- Lower when derivatives/short-interest indicate stress, crowding risk, or downside skew.
+
+COMPOSITE CALCULATION REQUIREMENT
+Compute exactly:
+composite_score_10 =
+  analyst_consensus*analyst_score +
+  institutional_positioning*institutional_score +
+  forward_revenue_visibility*revenue_score +
+  valuation_vs_historical_pe*valuation_score +
+  macro_and_sector_factors*macro_score +
+  options_and_short_interest*options_score
+
+ACTION MAPPING REQUIREMENT
+- Strong Buy: composite_score_10 >= 8.5
+- Buy: 7.0 <= composite_score_10 < 8.5
+- Hold: 5.0 <= composite_score_10 < 7.0
+- Reduce: 3.0 <= composite_score_10 < 5.0
+- Sell: composite_score_10 < 3.0
+
+CASE-WRITING GUIDELINES
+Provide bull_case, bear_case, hold_case:
+- reasoning: concise but specific, evidence-led narrative
+- confidence_pct: 0-100 reflecting evidence quality + consistency
+- supporting_institutions: known relevant firms/funds if present, else empty array
+Reasoning should be distinct across the three cases.
+
+QUALITY CONTROL CHECKLIST
+- Ensure all required keys exist.
+- Ensure factor scores are numeric and bounded 0-10.
+- Ensure confidence_pct values are 0-100.
+- Ensure composite_score_10 is numeric.
+- Ensure action aligns to computed composite.
+- Ensure no extra top-level keys beyond schema.
+
+OUTPUT SCHEMA (STRICT)
 {
   "bull_case": {
     "reasoning": "<string>",
-    "confidence_pct": <0-100>,
-    "supporting_institutions": ["<firm or fund names from 13F/analyst/web context>", ...]
+    "confidence_pct": <number 0-100>,
+    "supporting_institutions": ["<string>", "..."]
   },
   "bear_case": {
     "reasoning": "<string>",
-    "confidence_pct": <0-100>,
-    "supporting_institutions": [<string>, ...]
+    "confidence_pct": <number 0-100>,
+    "supporting_institutions": ["<string>", "..."]
   },
   "hold_case": {
     "reasoning": "<string>",
-    "confidence_pct": <0-100>,
-    "supporting_institutions": [<string>, ...]
+    "confidence_pct": <number 0-100>,
+    "supporting_institutions": ["<string>", "..."]
   },
-  "analyst_score": <0-10>,
-  "institutional_score": <0-10>,
-  "revenue_score": <0-10>,
-  "valuation_score": <0-10>,
-  "macro_score": <0-10>,
-  "options_score": <0-10>,
-  "composite_score_10": <number>,
-  "action": "Strong Buy"|"Buy"|"Hold"|"Reduce"|"Sell",
-  "thesis": "<optional one-line synthesis>"
-}
+  "analyst_score": <number 0-10>,
+  "institutional_score": <number 0-10>,
+  "revenue_score": <number 0-10>,
+  "valuation_score": <number 0-10>,
+  "macro_score": <number 0-10>,
+  "options_score": <number 0-10>,
+  "composite_score_10": <number 0-10>,
+  "action": "Strong Buy" | "Buy" | "Hold" | "Reduce" | "Sell",
+  "thesis": "<short synthesis string>"
+}"""
 
-SCORING:
-- Score each *_score from 0–10 independently using data + web_research_summaries (weight credibility via source_weight in summaries).
-- compound composite_score_10 EXACTLY as weighted average:
-  analyst_consensus*analyst_score + institutional_positioning*institutional_score + forward_revenue_visibility*revenue_score + valuation_vs_historical_pe*valuation_score + macro_and_sector_factors*macro_score + options_and_short_interest*options_score
-  (divide implied sum is already weighted since weights sum to 1 — compute sum of weight_i * score_i).
+# Estimated token count: ~1350 (intentionally >1024 for Anthropic prompt cache threshold).
+SONNET_PORTFOLIO_SYSTEM = """You are a portfolio strategist producing concise, actionable guidance.
+Each request contains holdings_analysis and web_research_summaries.
 
-ACTION mapping from composite_score_10:
-- Strong Buy: >= 8.5
-- Buy: >= 7
-- Hold: >= 5
-- Reduce: >= 3
-- Sell: < 3"""
+OBJECTIVE
+Identify concentration risks, provide a practical rebalancing recommendation, and suggest
+3-5 new ideas not currently held.
 
-SONNET_PORTFOLIO_SYSTEM = """You are a portfolio strategist. Each user message contains JSON with a holdings_analysis array (already analyzed positions) and web_research_summaries (Haiku-compressed web digests).
+CONSTRAINTS
+- Use only the provided JSON.
+- No browsing or tool use.
+- Prefer high-credibility web evidence (tier_1 then tier_2, etc.).
+- If evidence conflicts, disclose uncertainty and avoid overconfidence.
+- Output strict JSON only.
 
-You cannot use web_search or browse; only the JSON keys in each user message are available.
+PORTFOLIO RISK FRAMEWORK
+Evaluate:
+- single-name concentration
+- sector/style/factor crowding
+- valuation concentration (multiple compression sensitivity)
+- macro sensitivity concentration (rates/fx/commodity)
+- liquidity/event risk clustering
+Flag concrete risks in plain language with why they matter.
 
-Respond with strict JSON only (no markdown code fences). Use exactly this shape:
+REBALANCING GUIDANCE
+Recommendations should:
+- prioritize risk-adjusted return and diversification
+- align to quality/visibility over narrative momentum
+- indicate what to reduce/add and why
+- avoid unnecessary churn if portfolio is already balanced
+- mention sequencing when useful (e.g., trim first, then stage adds)
+
+NEW IDEA GENERATION
+Return 3 to 5 tickers not already held.
+For each idea thesis:
+- 1-3 sentences
+- include catalyst, risk lens, and fit versus existing exposures
+- avoid duplicating existing concentration unless justified
+
+SOURCE-WEIGHT POLICY
+- tier_1: strongest grounding (regulatory/primary-source style)
+- tier_2: high-quality secondary confirmation
+- tier_3 and other: contextual support, lower conviction weight
+Never let low-tier evidence dominate portfolio decisions.
+
+OUTPUT SCHEMA (STRICT)
 {
-  "concentration_risks": ["<string>", ...],
+  "concentration_risks": ["<string>", "..."],
   "rebalancing_recommendation": "<string>",
-  "new_stock_ideas": [{"ticker": "<string>", "thesis": "<string>"}, ...]
+  "new_stock_ideas": [
+    {"ticker": "<string>", "thesis": "<string>"},
+    {"ticker": "<string>", "thesis": "<string>"}
+  ]
 }
 
-Suggest 3 to 5 new stock ideas not already held; ground themes in web_research_summaries when present."""
+QUALITY CHECKS
+- concentration_risks must be an array of strings.
+- new_stock_ideas length must be 3..5 unless insufficient evidence.
+- Tickers should be uppercase symbols.
+- Do not include held symbols in new_stock_ideas.
+- No extra top-level keys.
 
-SONNET_SYSTEM_CACHE_CONTROL = {"type": "ephemeral"}
+Extended rubric notes for consistent evaluations:
+- Prefer businesses with resilient cash-flow and durable demand.
+- Penalize highly levered balance sheets in deteriorating macro setups.
+- Favor diversified earnings engines over single-product dependency.
+- Use valuation discipline even for high-growth narratives.
+- Evaluate regime dependence: rates up/down, inflation persistence, credit spread widening.
+- Translate risks into actionable portfolio moves, not generic commentary.
+- Keep recommendations implementable by an investor without institutional infrastructure.
+- Focus on durable risk controls first, alpha ideas second.
+- Minimize style whiplash unless clear evidence supports rotation.
+- Explain tradeoffs succinctly to support decision quality.
+
+Additional implementation guidance:
+- If holdings already include multiple correlated semis/software names, flag clustering.
+- If macro-sensitive cyclicals dominate, discuss economic slowdown drawdown risk.
+- If ideas are added in same sector, justify with non-overlapping drivers.
+- If data quality is low, return conservative and explicit caveats in recommendation text.
+- Preserve JSON validity under all circumstances.
+- Keep wording direct and evidence-linked.
+
+Repeatable decision principles:
+- evidence > narrative
+- diversification > concentration drift
+- durability > short-term noise
+- asymmetric upside with bounded downside > uncertain upside with unbounded downside
+- clear catalysts + quality balance sheets + reasonable valuation preferred
+
+These principles should shape every response consistently."""
+
+# Estimated token count: ~1320 (intentionally >1024 for Anthropic prompt cache threshold).
+HAIKU_STOCK_WEB_RESEARCH_SYSTEM = """You are a web-research retriever for a single stock.
+Use the web_search tool to gather high-signal, recent, and decision-relevant context.
+
+INPUTS PROVIDED IN USER MESSAGE
+- ticker
+- sector
+You must infer query phrasing and run multiple searches yourself.
+
+SEARCH STRATEGY
+Cover these topic families:
+1) official filings and disclosures
+2) earnings calls, guidance, and revisions
+3) institutional ownership / 13F style context
+4) credible analyst commentary and target revisions
+5) valuation context and peer comparisons
+6) macro + sector conditions impacting forward results
+7) options/short-interest sentiment context
+8) recent material events, legal/regulatory updates
+
+SOURCE PRIORITY
+Prioritize domains typically mapped to:
+- tier_1: sec.gov/edgar/seekingalpha-style transcript/filing sources
+- tier_2: Bloomberg/WSJ/FT/Reuters class sources
+- tier_3: CNBC/MarketWatch/Yahoo Finance class sources
+Avoid social chatter, forums, and unverified rumor sources.
+
+OUTPUT BEHAVIOR
+- Run web_search calls first.
+- Keep final assistant text minimal (one short acknowledgement).
+- Retrieved tool results are what downstream pipeline consumes.
+- Do not provide long narrative analysis in this step.
+
+QUALITY BAR
+- Favor recency and specificity.
+- Include multiple perspectives when possible.
+- Reduce duplicate-domain overconcentration.
+- Prefer concrete signals (figures, guidance, filings) to vague opinions.
+- Keep searches relevant to investor decision making.
+
+Detailed retrieval checklist:
+- Find at least one filing/disclosure-oriented result when available.
+- Find at least one earnings/guidance item when available.
+- Find at least one institutional positioning angle when available.
+- Find at least one valuation/peer context item when available.
+- Find at least one macro/sector context item when available.
+- Find at least one sentiment/options/short-interest context item when available.
+- Balance bullish and bearish evidence.
+- Avoid repeating equivalent searches that produce near-identical result sets.
+- Prefer reputable domains with clear attribution.
+- Avoid stale content unless historical context is required.
+
+Implementation discipline:
+- Use concise but precise search terms with ticker symbol.
+- Add sector terms to disambiguate broad tickers.
+- Include current year markers where useful.
+- Use terms like "guidance", "outlook", "filing", "transcript", "13F", "price target",
+  "short interest", and "implied volatility" where relevant.
+- Keep retrieval broad enough to capture unknown risks.
+- Never hallucinate search results; rely on tool output only.
+- Keep response format stable across runs to maximize deterministic downstream behavior.
+
+This instruction block is intentionally verbose for prompt caching and consistency."""
+
+# Estimated token count: ~1280 (intentionally >1024 for Anthropic prompt cache threshold).
+HAIKU_PORTFOLIO_WEB_RESEARCH_SYSTEM = """You are a web-research retriever for portfolio-level strategy.
+Use web_search to collect broad market and allocation-relevant context for current holdings.
+
+INPUT IN USER MESSAGE
+- tickers list/string representing currently held names
+
+RETRIEVAL OBJECTIVES
+1) cross-sector macro themes likely to affect rebalancing
+2) concentration and diversification considerations
+3) quality opportunities adjacent to current holdings
+4) risk management context (rates, liquidity, policy, cycle)
+5) candidate sectors/companies with improving forward setups
+
+SOURCE POLICY
+- Prefer high-credibility financial journalism and primary disclosures.
+- Keep a mix of top-tier and corroborative sources.
+- Avoid social media/forum rumor channels.
+
+WORKFLOW
+- Execute multiple web_search queries.
+- Gather diverse but relevant result sets.
+- Keep final natural-language reply short; downstream code ingests tool results.
+
+RISK-FIRST LENS
+- Search for evidence of regime shifts, earnings dispersion, valuation extremes,
+  and crowded positioning.
+- Seek data points that can justify trimming/adds in a rebalancing plan.
+
+QUERY DESIGN PRINCIPLES
+- Include tickers when helpful, but also search at portfolio/theme level.
+- Cover both upside opportunities and downside risks.
+- Favor recent information unless historical framing is needed.
+- Use terms such as "allocation", "diversification", "sector rotation",
+  "earnings revisions", "valuation dispersion", "risk premium".
+
+QUALITY CONTROLS
+- Avoid duplicate queries with only superficial wording changes.
+- Prefer sources with author/date/transparency.
+- Capture a balanced set of perspectives.
+- Keep retrieval tuned to practical investing actions.
+- Avoid noisy or promotional content.
+
+Extended guidance:
+- If holdings are concentrated in one sector, prioritize offsetting-theme research.
+- If growth-heavy, include rates and profitability regime context.
+- If value-heavy, include cyclicality and earnings sensitivity context.
+- Include global macro linkages where they materially impact US equities.
+- Keep retrieval broad enough to produce diverse new idea candidates.
+
+This instruction block is intentionally verbose for prompt caching and consistency."""
+
+# Estimated token count: ~1260 (intentionally >1024 for Anthropic prompt cache threshold).
+HAIKU_BATCH_SUMMARIZATION_SYSTEM = """You summarize multiple web results in batch for one source tier.
+Each request includes structured hit content; produce one summary per hit.
+
+GOAL
+Create investor-useful summaries that are faithful, specific when supported, and uncertainty-aware.
+
+INPUT EXPECTATIONS
+- A source_tier (tier_1, tier_2, tier_3, tier_other)
+- A sentence range target for each summary
+- A JSON array of hits with hit_id, title, url, page_age, and optional text excerpts
+
+OUTPUT REQUIREMENTS
+- Return strict JSON only:
+  {"summaries":[{"hit_id":0,"summary":"..."}]}
+- Include exactly one summary per input hit_id.
+- No markdown, no prose outside JSON.
+
+SUMMARY STYLE
+- Plain prose paragraphs.
+- Respect sentence range exactly for each hit.
+- Mention limitations when content is sparse.
+- Do not fabricate facts beyond title/url/excerpt evidence.
+
+TIER-SENSITIVE EMPHASIS
+- tier_1: prioritize concrete figures, dates, guidance, and filing-like specifics.
+- tier_2: emphasize credible market/analyst/business developments with context.
+- tier_3: keep to moderate-confidence takeaways and clearly supported points.
+- tier_other: concise, theme-level interpretation with explicit caution.
+
+QUALITY CONTROLS
+- Preserve attribution context implied by source metadata.
+- Prefer factual grounding to stylistic flourish.
+- Avoid repetitive phrasing across summaries.
+- Keep investor relevance explicit: potential impact on risk, earnings, valuation, or sentiment.
+- Avoid unsupported certainty language.
+
+ROBUSTNESS RULES
+- If a hit lacks enough text, infer cautiously from title/url/domain cues.
+- Never invent precise numbers that are not present.
+- If uncertain, state uncertainty in the summary text.
+- Keep each summary coherent and self-contained.
+
+FORMAT ENFORCEMENT
+- Ensure JSON parses cleanly.
+- hit_id must remain integer.
+- summary must be non-empty string.
+- output array length must match input array length.
+
+This instruction block is intentionally verbose for prompt caching and consistency."""
+
+# Estimated token count: ~1250 (intentionally >1024 for Anthropic prompt cache threshold).
+HAIKU_IMAGE_EXTRACTION_SYSTEM = """You extract holdings from brokerage screenshots.
+Output only valid JSON array of objects with ticker and quantity.
+
+PRIMARY TASK
+Identify equity/ETF rows and convert them to:
+[{"ticker":"AAPL","quantity":10}]
+
+STRICT RULES
+- No markdown, no prose, no explanations.
+- Ticker must be uppercase symbol text.
+- Quantity must be numeric.
+- Exclude cash, totals, headers, footers, account labels.
+- Exclude rows where ticker or quantity is missing/ambiguous.
+
+OCR ROBUSTNESS GUIDANCE
+- Handle commas, decimals, and common OCR artifacts.
+- Distinguish quantity from market value/price columns.
+- Ignore percentage-only rows unless quantity is clearly present.
+- Prefer precision but avoid false positives.
+
+NORMALIZATION RULES
+- Trim whitespace.
+- Remove currency symbols from quantities.
+- Preserve decimal shares when shown.
+- Skip duplicate rows unless they represent distinct holdings lines.
+
+QUALITY CHECKS
+- Return empty array if no reliable holdings are visible.
+- Never include malformed objects.
+- Keep schema exact on every element.
+
+This instruction block is intentionally verbose for prompt caching and consistency."""
+
+PROMPT_CACHE_CONTROL = {"type": "ephemeral"}
 
 
-def _sonnet_system_with_ephemeral_cache(instruction_text: str) -> List[Dict[str, Any]]:
-    """Build Messages API ``system`` with prompt caching on static instructions only.
-
-    ``cache_control`` is attached to blocks in the top-level ``system`` parameter—not inside
-    ``messages``—so the user JSON payload does not steal the cache breakpoint.
-    """
+def _system_with_ephemeral_cache(instruction_text: str) -> List[Dict[str, Any]]:
+    """Build top-level ``system`` blocks with Anthropic ephemeral prompt caching."""
     return [
         {
             "type": "text",
             "text": instruction_text,
-            "cache_control": SONNET_SYSTEM_CACHE_CONTROL,
+            "cache_control": PROMPT_CACHE_CONTROL,
         }
     ]
 
@@ -116,6 +470,8 @@ def _sonnet_system_with_ephemeral_cache(instruction_text: str) -> List[Dict[str,
 # Applies to every Messages API call (vision extract, Haiku research/summarize, Sonnet calls).
 ANTHROPIC_429_RETRY_WAIT_SEC = 60.0
 ANTHROPIC_429_MAX_RETRIES = 3  # retries after a 429; total attempts = MAX_RETRIES + 1
+ANTHROPIC_500_RETRY_WAIT_SEC = 10.0
+ANTHROPIC_500_MAX_RETRIES = 3  # retries after a 500; total attempts = MAX_RETRIES + 1
 
 # Pause after each per-stock Sonnet analysis before the next holding (not after the last).
 PER_STOCK_ANALYSIS_GAP_SEC = 10.0
@@ -146,11 +502,6 @@ MAX_WEB_SEARCH_HITS_PER_ROUND = 20
 MAX_SUMMARIES_PER_TARGETED_QUERY = 5
 MAX_PORTFOLIO_SEARCH_HITS_TO_SUMMARIZE = 15
 
-HAIKU_PORTFOLIO_WEB_RESEARCH_USER = """The portfolio currently includes these tickers: {tickers}
-
-Use the web_search tool to run one or more searches for: (1) current market themes useful for rebalancing, (2) diversification and risk, (3) quality companies or sectors to consider. Focus on recent, actionable context.
-
-You do not need to write a long answer—tool results are recorded for the next step."""
 
 
 def _normalized_hostname(url: str) -> str:
@@ -282,70 +633,110 @@ def _format_search_hit_for_summarizer(hit: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def haiku_summarize_search_hit(
+def _tier_sentence_bounds_and_focus(tier: str) -> tuple[int, int, str]:
+    if tier == "tier_1":
+        return (
+            10,
+            12,
+            "Tier 1 (highest credibility). Extract specific numbers, dates, filed metrics, and forward guidance "
+            "verbatim when available. If page text is scarce, rely on title/URL/domain and do not invent details.",
+        )
+    if tier == "tier_2":
+        return (
+            7,
+            8,
+            "Tier 2 (high credibility). Focus on market signals, analyst commentary, and business developments. "
+            "Extract key takeaways and any explicitly cited figures/dates.",
+        )
+    if tier == "tier_3":
+        return (
+            4,
+            5,
+            "Tier 3 (moderate credibility). Keep summaries high level and grounded only in clearly supported details.",
+        )
+    return (
+        3,
+        4,
+        "Other/unclassified source. Keep summaries concise and thematic rather than overly specific.",
+    )
+
+
+def haiku_summarize_search_hits_for_tier(
     client: Anthropic,
     *,
     research_context: str,
-    hit: Dict[str, Any],
-    source_weight: float,
-    sentences_min: int = 8,
-    sentences_max: int = 10,
-) -> str:
-    """Summarize one search hit (Haiku, no tools), with tier-weight dependent prompting."""
-    # Tier-focused guidance is driven by the classifier's `source_weight`.
-    # NOTE: sentence length is controlled by sentences_min/sentences_max supplied by the caller.
-    if source_weight >= 0.95:
-        tier_focus = (
-            "Tier 1 (highest credibility). Extract specific numbers, dates, filed metrics, and any forward guidance "
-            "verbatim where present. If page text is scarce, rely on the title/URL/domain but do not invent details."
-        )
-    elif source_weight >= 0.75:
-        tier_focus = (
-            "Tier 2 (high credibility). Focus on market signals, analyst commentary, and business developments. "
-            "Extract key takeaways and any cited figures/dates if explicitly present."
-        )
-    elif source_weight >= 0.59:
-        tier_focus = (
-            "Tier 3 (moderate credibility). Keep it high level. Use only what is clearly supported by the result text/title; "
-            "avoid heavy quoting or detailed filings."
-        )
-    else:
-        tier_focus = (
-            "Other/unclassified source. Keep the summary concise and high level, focusing on general themes rather than specifics."
+    source_tier: str,
+    hits: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Summarize all hits in a tier with one Haiku call; returns [{hit_id, summary}]."""
+    if not hits:
+        return []
+    sentences_min, sentences_max, _tier_focus = _tier_sentence_bounds_and_focus(source_tier)
+    hits_payload: List[Dict[str, Any]] = []
+    for i, hit in enumerate(hits):
+        hits_payload.append(
+            {
+                "hit_id": i,
+                "title": hit.get("title", ""),
+                "url": hit.get("url", ""),
+                "page_age": hit.get("page_age"),
+                "page_text_excerpt": _optional_text_from_encrypted(hit.get("encrypted_content") or ""),
+            }
         )
     user_msg = (
-        f"Research context: {research_context}\n\n"
-        f"Single web search result to summarize:\n{_format_search_hit_for_summarizer(hit)}\n\n"
-        f"Source credibility weight: {source_weight}\n"
-        f"Target summary length: {sentences_min} to {sentences_max} complete sentences\n\n"
-        f"{tier_focus}\n\n"
-        f"Write between {sentences_min} and {sentences_max} complete sentences in plain prose "
-        "(no bullets, no JSON). Explain what the source is about, why it may matter to investors, "
-        "and any limitations if page text was scarce (infer carefully from title/URL/domain when needed)."
+        f"research_context={research_context}\n"
+        f"source_tier={source_tier}\n"
+        f"sentences_min={sentences_min}\n"
+        f"sentences_max={sentences_max}\n"
+        f"hits_json={json.dumps(hits_payload, default=str)}"
     )
     r = anthropic_messages_create(
         client,
         model=HAIKU_MODEL,
         max_tokens=HAIKU_SEARCH_HIT_SUMMARY_MAX_TOKENS,
+        system=_system_with_ephemeral_cache(HAIKU_BATCH_SUMMARIZATION_SYSTEM),
         messages=[{"role": "user", "content": user_msg}],
     )
-    return "".join(c.text for c in r.content if c.type == "text").strip()
+    text = "".join(c.text for c in r.content if c.type == "text").strip()
+    parsed = extract_json_from_text(text)
+    if isinstance(parsed, dict):
+        summaries = parsed.get("summaries")
+        if isinstance(summaries, list):
+            out: List[Dict[str, Any]] = []
+            for item in summaries:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    hit_id = int(item.get("hit_id"))
+                except Exception:
+                    continue
+                summary_text = str(item.get("summary", "")).strip()
+                if summary_text:
+                    out.append({"hit_id": hit_id, "summary": summary_text})
+            if out:
+                return out
+    # Fallback: keep the run resilient even if model output is malformed.
+    return [{"hit_id": i, "summary": "Summary unavailable for this source."} for i, _ in enumerate(hits)]
 
 
-def haiku_web_search_single_query(client: Anthropic, query: str) -> List[Dict[str, Any]]:
-    """One Haiku call with web_search for a fixed query."""
+def haiku_web_search_for_stock(client: Anthropic, ticker: str, sector: str | None) -> List[Dict[str, Any]]:
+    """One Haiku+web_search retrieval call for a stock context."""
+    sector_text = (sector or "Unknown").strip() or "Unknown"
     research = anthropic_messages_create(
         client,
         model=HAIKU_MODEL,
         max_tokens=HAIKU_SINGLE_WEB_SEARCH_MAX_TOKENS,
+        system=_system_with_ephemeral_cache(HAIKU_STOCK_WEB_RESEARCH_SYSTEM),
         tools=[{"type": "web_search_20250305", "name": "web_search"}],
         messages=[
             {
                 "role": "user",
-                "content": (
-                    "Use the web_search tool to run searches for exactly this topic. "
-                    "When you have retrieval results in context, reply with one short acknowledging sentence.\n\n"
-                    f"{query}"
+                "content": json.dumps(
+                    {
+                        "ticker": ticker.strip().upper(),
+                        "sector": sector_text,
+                    },
+                    default=str,
                 ),
             }
         ],
@@ -368,54 +759,68 @@ def sentence_targets_for_source_weight(source_weight: float) -> tuple[int, int]:
 def build_web_research_summaries_for_stock(
     client: Anthropic, ticker: str, sector: str | None
 ) -> List[Dict[str, Any]]:
-    """12 sequential targeted Haiku+web searches; tier-weighted per-hit summarization."""
-    out: List[Dict[str, Any]] = []
+    """Stock web research retrieval + tier-batched summarization."""
+    collected_hits: List[Dict[str, Any]] = []
     ctx = f"Targeted diligence for {ticker.upper()}"
-    for query in stock_targeted_search_queries(ticker, sector):
-        hits = haiku_web_search_single_query(client, query)
-        tier3_count = 0
-        other_count = 0
-        for h in hits:
-            url = h.get("url") or ""
-            tier, weight = classify_search_source(url)
-            if tier == "blocked" or weight <= 0:
+    hits = haiku_web_search_for_stock(client, ticker, sector)
+    tier3_count = 0
+    other_count = 0
+    for h in hits:
+        url = h.get("url") or ""
+        tier, weight = classify_search_source(url)
+        if tier == "blocked" or weight <= 0:
+            continue
+
+        if tier == "tier_3":
+            if tier3_count >= 3:
+                continue
+        elif tier == "tier_other":
+            if other_count >= 3:
                 continue
 
-            # Per search-round policy:
-            # - Tier 1/2: summarize all hits found (no cap).
-            # - Tier 3 and "other": summarize only the first 3 hits in that tier.
-            if tier == "tier_3":
-                if tier3_count >= 3:
-                    continue
-            elif tier == "tier_other":
-                if other_count >= 3:
-                    continue
-            # tier_1 and tier_2 have no cap.
-
-            sentences_min, sentences_max = sentence_targets_for_source_weight(weight)
-            summary = haiku_summarize_search_hit(
-                client,
-                research_context=ctx,
-                hit=h,
-                source_weight=weight,
-                sentences_min=sentences_min,
-                sentences_max=sentences_max,
-            )
+        collected_hits.append(
+            {
+                "search_query": f"{ticker.upper()} broad_research",
+                "title": h.get("title"),
+                "url": url,
+                "page_age": h.get("page_age"),
+                "encrypted_content": h.get("encrypted_content"),
+                "source_tier": tier,
+                "source_weight": weight,
+            }
+        )
+        if tier == "tier_3":
+            tier3_count += 1
+        elif tier == "tier_other":
+            other_count += 1
+    out: List[Dict[str, Any]] = []
+    for tier in ["tier_1", "tier_2", "tier_3", "tier_other"]:
+        tier_hits = [h for h in collected_hits if h.get("source_tier") == tier]
+        if not tier_hits:
+            continue
+        summaries = haiku_summarize_search_hits_for_tier(
+            client,
+            research_context=ctx,
+            source_tier=tier,
+            hits=tier_hits,
+        )
+        summary_by_id = {
+            int(s.get("hit_id")): str(s.get("summary", "")).strip()
+            for s in summaries
+            if isinstance(s, dict)
+        }
+        for i, h in enumerate(tier_hits):
             out.append(
                 {
-                    "search_query": query,
+                    "search_query": h.get("search_query"),
                     "title": h.get("title"),
-                    "url": url,
+                    "url": h.get("url"),
                     "page_age": h.get("page_age"),
-                    "summary": summary,
-                    "source_tier": tier,
-                    "source_weight": weight,
+                    "summary": summary_by_id.get(i, "Summary unavailable for this source."),
+                    "source_tier": h.get("source_tier"),
+                    "source_weight": h.get("source_weight"),
                 }
             )
-            if tier == "tier_3":
-                tier3_count += 1
-            elif tier == "tier_other":
-                other_count += 1
     return out
 
 
@@ -427,38 +832,59 @@ def build_web_research_summaries_for_portfolio(
         client,
         model=HAIKU_MODEL,
         max_tokens=HAIKU_PORTFOLIO_WEB_RESEARCH_MAX_TOKENS,
+        system=_system_with_ephemeral_cache(HAIKU_PORTFOLIO_WEB_RESEARCH_SYSTEM),
         tools=[{"type": "web_search_20250305", "name": "web_search"}],
         messages=[
             {
                 "role": "user",
-                "content": HAIKU_PORTFOLIO_WEB_RESEARCH_USER.format(tickers=tickers_str),
+                "content": json.dumps({"tickers": tickers_str}, default=str),
             }
         ],
     )
     hits = extract_web_search_hits_from_response(research)[:MAX_PORTFOLIO_SEARCH_HITS_TO_SUMMARIZE]
-    out: List[Dict[str, Any]] = []
+    collected_hits: List[Dict[str, Any]] = []
     ctx = f"Portfolio-level research; current holdings: {tickers_str}"
     for h in hits:
         url = h.get("url") or ""
         tier, weight = classify_search_source(url)
         if tier == "blocked" or weight <= 0:
             continue
-        sentences_min, sentences_max = sentence_targets_for_source_weight(weight)
-        summary = haiku_summarize_search_hit(
-            client,
-            research_context=ctx,
-            hit=h,
-            source_weight=weight,
-            sentences_min=sentences_min,
-            sentences_max=sentences_max,
-        )
-        out.append(
+        collected_hits.append(
             {
                 "title": h.get("title"),
                 "url": h.get("url"),
-                "summary": summary,
+                "page_age": h.get("page_age"),
+                "encrypted_content": h.get("encrypted_content"),
+                "source_tier": tier,
+                "source_weight": weight,
             }
         )
+    out: List[Dict[str, Any]] = []
+    for tier in ["tier_1", "tier_2", "tier_3", "tier_other"]:
+        tier_hits = [h for h in collected_hits if h.get("source_tier") == tier]
+        if not tier_hits:
+            continue
+        summaries = haiku_summarize_search_hits_for_tier(
+            client,
+            research_context=ctx,
+            source_tier=tier,
+            hits=tier_hits,
+        )
+        summary_by_id = {
+            int(s.get("hit_id")): str(s.get("summary", "")).strip()
+            for s in summaries
+            if isinstance(s, dict)
+        }
+        for i, h in enumerate(tier_hits):
+            out.append(
+                {
+                    "title": h.get("title"),
+                    "url": h.get("url"),
+                    "summary": summary_by_id.get(i, "Summary unavailable for this source."),
+                    "source_tier": h.get("source_tier"),
+                    "source_weight": h.get("source_weight"),
+                }
+            )
     return out
 
 
@@ -470,7 +896,7 @@ def _claude_debug_payload_enabled() -> bool:
 
 
 def anthropic_messages_create(client: Anthropic, **kwargs: Any) -> Any:
-    """Call Messages API. On 429: exponential backoff from RETRY_WAIT_SEC, up to MAX_RETRIES retries."""
+    """Call Messages API with retries for throttling/server faults."""
     if _claude_debug_payload_enabled():
         payload_repr = json.dumps(kwargs, default=str, sort_keys=True)
         model = kwargs.get("model", "?")
@@ -478,16 +904,25 @@ def anthropic_messages_create(client: Anthropic, **kwargs: Any) -> Any:
             f"[Claude API debug] model={model} payload_character_count={len(payload_repr)}",
             flush=True,
         )
-    max_attempts = ANTHROPIC_429_MAX_RETRIES + 1
+    max_attempts = max(ANTHROPIC_429_MAX_RETRIES, ANTHROPIC_500_MAX_RETRIES) + 1
     for attempt in range(max_attempts):
         try:
             return client.messages.create(**kwargs)
         except APIStatusError as e:
-            if getattr(e, "status_code", None) != 429:
+            status_code = getattr(e, "status_code", None)
+            if status_code == 429:
+                if attempt >= ANTHROPIC_429_MAX_RETRIES:
+                    raise
+                time.sleep(ANTHROPIC_429_RETRY_WAIT_SEC * (2**attempt))
+                continue
+            if status_code == 500:
+                if attempt >= ANTHROPIC_500_MAX_RETRIES:
+                    raise
+                time.sleep(ANTHROPIC_500_RETRY_WAIT_SEC * (2**attempt))
+                continue
+            if status_code is None:
                 raise
-            if attempt == max_attempts - 1:
-                raise
-            time.sleep(ANTHROPIC_429_RETRY_WAIT_SEC * (2**attempt))
+            raise
     assert False, "anthropic_messages_create exhausted without return"
 
 
@@ -609,21 +1044,16 @@ def image_to_base64(uploaded_file) -> str:
 
 
 def extract_holdings_from_image(client: Anthropic, image_b64: str, media_type: str) -> List[Dict[str, Any]]:
-    prompt = (
-        "You are reading a brokerage portfolio screenshot. Extract only stock/ETF holdings. "
-        "Return strict JSON array where each item is "
-        '{"ticker":"AAPL","quantity":10}. '
-        "Rules: uppercase ticker, numeric quantity, ignore cash/headers/rows without ticker."
-    )
     response = anthropic_messages_create(
         client,
         model=HAIKU_MODEL,
         max_tokens=1200,
+        system=_system_with_ephemeral_cache(HAIKU_IMAGE_EXTRACTION_SYSTEM),
         messages=[
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": prompt},
+                    {"type": "text", "text": "Extract holdings from this brokerage screenshot."},
                     {
                         "type": "image",
                         "source": {
@@ -1062,7 +1492,7 @@ def analyze_with_sonnet(
     kwargs: Dict[str, Any] = {
         "model": SONNET_MODEL,
         "max_tokens": 4096,
-        "system": _sonnet_system_with_ephemeral_cache(SONNET_STOCK_ANALYSIS_SYSTEM),
+        "system": _system_with_ephemeral_cache(SONNET_STOCK_ANALYSIS_SYSTEM),
         "messages": [
             {
                 "role": "user",
@@ -1107,7 +1537,7 @@ def portfolio_recommendations_with_sonnet(client: Anthropic, holdings_analysis: 
         client,
         model=SONNET_MODEL,
         max_tokens=2000,
-        system=_sonnet_system_with_ephemeral_cache(SONNET_PORTFOLIO_SYSTEM),
+        system=_system_with_ephemeral_cache(SONNET_PORTFOLIO_SYSTEM),
         messages=[
             {"role": "user", "content": json.dumps(user_payload, default=str)}
         ],
@@ -1201,6 +1631,7 @@ def run_full_analysis_pipeline(
     *,
     show_progress: bool,
     status_placeholder: Any | None = None,
+    on_stock_complete: Callable[[int, str, Dict[str, Any]], None] | None = None,
 ) -> tuple[
     Dict[str, Dict[str, Any]],
     Dict[str, Dict[str, Any]],
@@ -1243,6 +1674,8 @@ def run_full_analysis_pipeline(
                 "analysis": analysis,
             }
         )
+        if on_stock_complete is not None:
+            on_stock_complete(idx + 1, ticker, analysis)
         if prog is not None:
             prog.progress((idx + 1) / len(holdings))
 
@@ -1369,9 +1802,25 @@ def run_app():
         holdings_batch = load_saved_portfolio(sb_client, user_id)
         if not holdings_batch:
             return
+        batch_run_id = str(uuid4())
         scoring_weights_run = dict(
             st.session_state.get("scoring_weights") or DEFAULT_SCORING_WEIGHTS
         )
+        batch_weights_used = {**scoring_weights_run, "_run_mode": "batch"}
+        batch_analysis_map: Dict[str, Dict[str, Any]] = {}
+
+        def _save_batch_partial(completed_count: int, _ticker: str, analysis: Dict[str, Any]) -> None:
+            batch_analysis_map[_ticker] = analysis
+            partial_holdings = holdings_batch[:completed_count]
+            upsert_portfolio_run_snapshot(
+                sb_client,
+                run_id=batch_run_id,
+                user_id=user_id,
+                holdings=partial_holdings,
+                results_summary=build_results_summary_rows(partial_holdings, batch_analysis_map),
+                weights_used=batch_weights_used,
+            )
+
         (
             _normalized_map,
             analysis_map,
@@ -1385,17 +1834,16 @@ def run_app():
             scoring_weights_run,
             show_progress=False,
             status_placeholder=None,
+            on_stock_complete=_save_batch_partial,
         )
         results_summary = build_results_summary_rows(holdings_batch, analysis_map)
-        save_portfolio_run(
+        upsert_portfolio_run_snapshot(
             sb_client,
+            run_id=batch_run_id,
             user_id=user_id,
             holdings=holdings_batch,
             results_summary=results_summary,
-            weights_used={
-                **scoring_weights_run,
-                "_run_mode": "batch",
-            },
+            weights_used=batch_weights_used,
         )
         st.session_state["last_batch_run"] = datetime.now(
             ZoneInfo("America/Los_Angeles")
@@ -1411,6 +1859,10 @@ def run_app():
         schedule.clear("overnight_analysis")
         st.session_state["_scheduled_job_time"] = None
     schedule.run_pending()
+
+    staged_manual_holdings = st.session_state.pop("manual_holdings_input_staged", None)
+    if staged_manual_holdings is not None:
+        st.session_state["manual_holdings_input"] = staged_manual_holdings
 
     if "manual_holdings_input" not in st.session_state:
         loaded_holdings = load_saved_portfolio(sb_client, user_id)
@@ -1432,7 +1884,8 @@ def run_app():
             with st.spinner("Extracting holdings with Claude Haiku Vision..."):
                 image_b64 = image_to_base64(uploaded)
                 extracted = extract_holdings_from_image(client, image_b64, uploaded.type or "image/png")
-                st.session_state["manual_holdings_input"] = format_holdings_as_manual_input(extracted)
+                st.session_state["manual_holdings_input_staged"] = format_holdings_as_manual_input(extracted)
+                st.rerun()
 
     st.write("Confirm or edit holdings before analysis (updates from the text field as you type):")
     edit_df = pd.DataFrame(parsed_live if parsed_live else [{"ticker": "", "quantity": 0}])
@@ -1448,6 +1901,42 @@ def run_app():
         if not holdings:
             st.error("Please add at least one valid holding.")
             st.stop()
+        manual_run_id = str(uuid4())
+        live_weights_used = {
+            **(st.session_state.get("scoring_weights") or DEFAULT_SCORING_WEIGHTS),
+            "_run_mode": "manual",
+        }
+        live_progress_box = st.empty()
+        progressive_rows: List[Dict[str, Any]] = []
+        live_analysis_map: Dict[str, Dict[str, Any]] = {}
+
+        def _save_and_render_partial(completed_count: int, ticker: str, analysis: Dict[str, Any]) -> None:
+            live_analysis_map[ticker] = analysis
+            score_v = analysis.get("composite_score_10")
+            try:
+                score_disp = f"{float(score_v):.2f}"
+            except (TypeError, ValueError):
+                score_disp = "N/A"
+            progressive_rows.append(
+                {
+                    "Ticker": ticker,
+                    "Composite Score (0-10)": score_disp,
+                    "Action": analysis.get("action") or "Hold",
+                }
+            )
+            partial_holdings = holdings[:completed_count]
+            upsert_portfolio_run_snapshot(
+                sb_client,
+                run_id=manual_run_id,
+                user_id=user_id,
+                holdings=partial_holdings,
+                results_summary=build_results_summary_rows(partial_holdings, live_analysis_map),
+                weights_used=live_weights_used,
+            )
+            with live_progress_box.container():
+                st.info(f"Completed {completed_count}/{len(holdings)} stocks")
+                st.dataframe(pd.DataFrame(progressive_rows), use_container_width=True, hide_index=True)
+
         with st.spinner("Pulling market data and running AI analysis..."):
             scoring_weights_run = dict(
                 st.session_state.get("scoring_weights") or DEFAULT_SCORING_WEIGHTS
@@ -1466,14 +1955,16 @@ def run_app():
                 scoring_weights_run,
                 show_progress=True,
                 status_placeholder=status_box,
+                on_stock_complete=_save_and_render_partial,
             )
             results_summary = build_results_summary_rows(holdings, analysis_map)
-            save_portfolio_run(
+            upsert_portfolio_run_snapshot(
                 sb_client,
+                run_id=manual_run_id,
                 user_id=user_id,
                 holdings=holdings,
                 results_summary=results_summary,
-                weights_used={**scoring_weights_run, "_run_mode": "manual"},
+                weights_used=live_weights_used,
             )
 
             st.session_state["results"] = {

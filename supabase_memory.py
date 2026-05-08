@@ -151,6 +151,49 @@ def save_portfolio_run(
         return
 
 
+def upsert_portfolio_run_snapshot(
+    client: Optional[httpx.Client],
+    *,
+    run_id: str,
+    user_id: str,
+    holdings: List[Dict[str, Any]],
+    results_summary: List[Dict[str, Any]],
+    weights_used: Dict[str, float],
+) -> None:
+    """Upsert an in-flight run snapshot so partial progress is durable."""
+    if client is None:
+        return
+    now_iso = datetime.now(timezone.utc).isoformat()
+    run_payload = {
+        "id": run_id,
+        "user_id": user_id,
+        "run_timestamp": now_iso,
+        "holdings": holdings,
+        "results_summary": results_summary,
+        "weights_used": weights_used,
+    }
+    memory_payload = {
+        "user_id": user_id,
+        "tickers_json": holdings,
+        "updated_at": now_iso,
+    }
+    try:
+        client.post(
+            "/portfolio_runs",
+            params={"on_conflict": "id"},
+            json=run_payload,
+            headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+        ).raise_for_status()
+        client.post(
+            "/saved_portfolio",
+            params={"on_conflict": "user_id"},
+            json=memory_payload,
+            headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+        ).raise_for_status()
+    except Exception:
+        return
+
+
 def fetch_recent_runs(client: Optional[httpx.Client], user_id: str, limit: int = 10) -> List[Dict[str, Any]]:
     if client is None:
         return []
