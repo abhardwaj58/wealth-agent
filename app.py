@@ -17,10 +17,12 @@ import streamlit as st
 import yfinance as yf
 from anthropic import Anthropic, APIStatusError
 from supabase_memory import (
+    fetch_cached_stock_analysis,
     fetch_recent_runs,
-    get_or_create_user_id,
+    get_or_create_user_by_email,
     get_supabase_client_singleton,
     load_saved_portfolio,
+    save_stock_analysis_cache,
     upsert_portfolio_run_snapshot,
 )
 
@@ -429,18 +431,32 @@ QUALITY CHECKS
 
 This instruction block is intentionally verbose for prompt caching and consistency."""
 
-PROMPT_CACHE_CONTROL = {"type": "ephemeral"}
+# Shared web_search tool definition (same object for every Haiku search request).
+HAIKU_WEB_SEARCH_TOOLS: List[Dict[str, str]] = [{"type": "web_search_20250305", "name": "web_search"}]
+
+# Identical suffix on every cached system route: keeps cache_control on block 1 only; no dynamic text here.
+_SYSTEM_CACHE_ANCHOR_SUFFIX = (
+    "Static policy anchor: all ticker symbols, quantities, prices, fetched JSON payloads, "
+    "run identifiers, and timestamps appear only in user messages, never in these system instructions."
+)
 
 
-def _system_with_ephemeral_cache(instruction_text: str) -> List[Dict[str, Any]]:
-    """Build top-level ``system`` blocks with Anthropic ephemeral prompt caching."""
+def _cached_instruction_system_blocks(instruction_text: str) -> List[Dict[str, Any]]:
+    """Block 1: cacheable static instructions. Block 2: short static text without cache_control."""
     return [
-        {
-            "type": "text",
-            "text": instruction_text,
-            "cache_control": PROMPT_CACHE_CONTROL,
-        }
+        {"type": "text", "text": instruction_text, "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": _SYSTEM_CACHE_ANCHOR_SUFFIX},
     ]
+
+
+_STATIC_CACHED_SYSTEM_BLOCKS: Dict[str, List[Dict[str, Any]]] = {
+    "sonnet_stock": _cached_instruction_system_blocks(SONNET_STOCK_ANALYSIS_SYSTEM),
+    "sonnet_portfolio": _cached_instruction_system_blocks(SONNET_PORTFOLIO_SYSTEM),
+    "haiku_stock_research": _cached_instruction_system_blocks(HAIKU_STOCK_WEB_RESEARCH_SYSTEM),
+    "haiku_portfolio_research": _cached_instruction_system_blocks(HAIKU_PORTFOLIO_WEB_RESEARCH_SYSTEM),
+    "haiku_batch_summarization": _cached_instruction_system_blocks(HAIKU_BATCH_SUMMARIZATION_SYSTEM),
+    "haiku_image_extraction": _cached_instruction_system_blocks(HAIKU_IMAGE_EXTRACTION_SYSTEM),
+}
 
 
 # On HTTP 429: exponential backoff (60s, 120s, 240s), up to MAX_RETRIES retries per request.
@@ -478,7 +494,7 @@ HAIKU_SEARCH_HIT_SUMMARY_MAX_TOKENS = 4000
 MAX_WEB_SEARCH_HITS_PER_ROUND = 20
 MAX_SUMMARIES_PER_TARGETED_QUERY = 5
 MAX_PORTFOLIO_SEARCH_HITS_TO_SUMMARIZE = 15
-MAX_HAIKU_WEB_SEARCH_CALLS_PER_STOCK = 12
+MAX_HAIKU_WEB_SEARCH_CALLS_PER_STOCK = 8
 DEBUG_LOG_FILE = Path(__file__).resolve().parent / "debug_log.txt"
 
 
@@ -705,7 +721,7 @@ def haiku_summarize_search_hits_for_tier(
         client,
         model=HAIKU_MODEL,
         max_tokens=HAIKU_SEARCH_HIT_SUMMARY_MAX_TOKENS,
-        system=_system_with_ephemeral_cache(HAIKU_BATCH_SUMMARIZATION_SYSTEM),
+        system=_STATIC_CACHED_SYSTEM_BLOCKS["haiku_batch_summarization"],
         messages=[{"role": "user", "content": user_msg}],
     )
     text = "".join(c.text for c in r.content if c.type == "text").strip()
@@ -753,8 +769,8 @@ def haiku_web_search_for_stock(
         client,
         model=HAIKU_MODEL,
         max_tokens=HAIKU_SINGLE_WEB_SEARCH_MAX_TOKENS,
-        system=_system_with_ephemeral_cache(HAIKU_STOCK_WEB_RESEARCH_SYSTEM),
-        tools=[{"type": "web_search_20250305", "name": "web_search"}],
+        system=_STATIC_CACHED_SYSTEM_BLOCKS["haiku_stock_research"],
+        tools=HAIKU_WEB_SEARCH_TOOLS,
         messages=[
             {
                 "role": "user",
@@ -870,8 +886,8 @@ def build_web_research_summaries_for_portfolio(
         client,
         model=HAIKU_MODEL,
         max_tokens=HAIKU_PORTFOLIO_WEB_RESEARCH_MAX_TOKENS,
-        system=_system_with_ephemeral_cache(HAIKU_PORTFOLIO_WEB_RESEARCH_SYSTEM),
-        tools=[{"type": "web_search_20250305", "name": "web_search"}],
+        system=_STATIC_CACHED_SYSTEM_BLOCKS["haiku_portfolio_research"],
+        tools=HAIKU_WEB_SEARCH_TOOLS,
         messages=[
             {
                 "role": "user",
@@ -1134,7 +1150,7 @@ def extract_holdings_from_image(client: Anthropic, image_b64: str, media_type: s
         client,
         model=HAIKU_MODEL,
         max_tokens=1200,
-        system=_system_with_ephemeral_cache(HAIKU_IMAGE_EXTRACTION_SYSTEM),
+        system=_STATIC_CACHED_SYSTEM_BLOCKS["haiku_image_extraction"],
         messages=[
             {
                 "role": "user",
@@ -1306,23 +1322,41 @@ def get_stock_raw_data(yf_symbol: str, *, display_ticker: str | None = None) -> 
     options_dates = tk.options
 
     # Pull selected statistics from nearest options expiration chain (Yahoo Finance option chain)
-    opt_snapshot = {}
-    if options_dates:
-        nearest_expiry = options_dates[0]
-        chain = tk.option_chain(nearest_expiry)
-        call_oi = float(chain.calls["openInterest"].fillna(0).sum()) if not chain.calls.empty else 0.0
-        put_oi = float(chain.puts["openInterest"].fillna(0).sum()) if not chain.puts.empty else 0.0
-        call_put_ratio = (call_oi / put_oi) if put_oi > 0 else None
-        call_iv = float(chain.calls["impliedVolatility"].dropna().mean()) if not chain.calls.empty else None
-        put_iv = float(chain.puts["impliedVolatility"].dropna().mean()) if not chain.puts.empty else None
-        opt_snapshot = {
-            "nearest_expiry": nearest_expiry,
-            "call_open_interest": call_oi,
-            "put_open_interest": put_oi,
-            "call_put_oi_ratio": call_put_ratio,
-            "avg_call_iv": call_iv,
-            "avg_put_iv": put_iv,
-        }
+    opt_snapshot: Dict[str, Any] = {}
+    if not options_dates:
+        opt_snapshot = {"options_chain_unavailable": True}
+    else:
+        try:
+            nearest_expiry = options_dates[0]
+            chain = tk.option_chain(nearest_expiry)
+            calls_empty = chain.calls.empty
+            puts_empty = chain.puts.empty
+            if calls_empty and puts_empty:
+                opt_snapshot = {"options_chain_unavailable": True}
+            else:
+                call_oi = float(chain.calls["openInterest"].fillna(0).sum()) if not calls_empty else 0.0
+                put_oi = float(chain.puts["openInterest"].fillna(0).sum()) if not puts_empty else 0.0
+                if call_oi + put_oi <= 0.0:
+                    opt_snapshot = {"options_chain_unavailable": True}
+                else:
+                    call_put_ratio = (call_oi / put_oi) if put_oi > 0 else None
+                    call_iv = (
+                        float(chain.calls["impliedVolatility"].dropna().mean()) if not calls_empty else None
+                    )
+                    put_iv = (
+                        float(chain.puts["impliedVolatility"].dropna().mean()) if not puts_empty else None
+                    )
+                    opt_snapshot = {
+                        "nearest_expiry": nearest_expiry,
+                        "call_open_interest": call_oi,
+                        "put_open_interest": put_oi,
+                        "call_put_oi_ratio": call_put_ratio,
+                        "avg_call_iv": call_iv,
+                        "avg_put_iv": put_iv,
+                        "options_chain_unavailable": False,
+                    }
+        except Exception:
+            opt_snapshot = {"options_chain_unavailable": True}
 
     # Summarize analyst recommendations (Yahoo Finance analyst data via yfinance)
     rec_summary = {"buy": 0, "hold": 0, "sell": 0, "sources": []}
@@ -1452,6 +1486,20 @@ def get_stock_raw_data(yf_symbol: str, *, display_ticker: str | None = None) -> 
     }
 
 
+def get_live_price_refresh_snapshot(yf_symbol: str) -> Dict[str, float | None]:
+    """Single lightweight yfinance info fetch for live price/52W refresh on cache hits."""
+    try:
+        tk = yf.Ticker(yf_symbol)
+        info = tk.info or {}
+    except Exception:
+        info = {}
+    return {
+        "current_price": _as_float(info.get("currentPrice") or info.get("regularMarketPrice")),
+        "fifty_two_week_high": _as_float(info.get("fiftyTwoWeekHigh")),
+        "fifty_two_week_low": _as_float(info.get("fiftyTwoWeekLow")),
+    }
+
+
 def _as_float(v: Any) -> float | None:
     if v is None:
         return None
@@ -1506,7 +1554,7 @@ def _iv_as_decimal(iv: float | None) -> float | None:
 
 def interpret_call_put_oi_ratio(ratio: float | None) -> str:
     if ratio is None or (isinstance(ratio, float) and math.isnan(ratio)):
-        return "No options open-interest ratio available (missing chain or data)."
+        return "Options data unavailable for this ticker."
     if ratio > 1.5:
         return "Bullish options positioning"
     if ratio < 0.7:
@@ -1547,15 +1595,18 @@ def normalize_stock_data(raw_payload: Dict[str, Any]) -> Dict[str, Any]:
     fwd_pe = _as_float(info.get("forward_pe"))
     current_pe = trail_pe if trail_pe is not None else fwd_pe
 
-    call_iv = _as_float(opt.get("avg_call_iv"))
-    put_iv = _as_float(opt.get("avg_put_iv"))
+    chain_unavailable = bool(opt.get("options_chain_unavailable"))
+
+    call_iv = None if chain_unavailable else _as_float(opt.get("avg_call_iv"))
+    put_iv = None if chain_unavailable else _as_float(opt.get("avg_put_iv"))
     implied_volatility: float | None = None
-    if call_iv is not None and put_iv is not None:
-        implied_volatility = (call_iv + put_iv) / 2.0
-    elif call_iv is not None:
-        implied_volatility = call_iv
-    elif put_iv is not None:
-        implied_volatility = put_iv
+    if not chain_unavailable:
+        if call_iv is not None and put_iv is not None:
+            implied_volatility = (call_iv + put_iv) / 2.0
+        elif call_iv is not None:
+            implied_volatility = call_iv
+        elif put_iv is not None:
+            implied_volatility = put_iv
 
     short_raw = _as_float(info.get("short_percent_of_float"))
     short_interest_pct_float: float | None = None
@@ -1594,9 +1645,12 @@ def normalize_stock_data(raw_payload: Dict[str, Any]) -> Dict[str, Any]:
             "sources": list(rec.get("sources") or []),
         },
         "options_sentiment": {
-            "call_put_open_interest_ratio": _as_float(opt.get("call_put_oi_ratio")),
+            "call_put_open_interest_ratio": (
+                None if chain_unavailable else _as_float(opt.get("call_put_oi_ratio"))
+            ),
             "implied_volatility": implied_volatility,
-            "nearest_expiry": opt.get("nearest_expiry"),
+            "nearest_expiry": None if chain_unavailable else opt.get("nearest_expiry"),
+            "options_chain_unavailable": chain_unavailable,
         },
         "short_interest_pct_float": short_interest_pct_float,
         "history_1y_close": history_1y_close,
@@ -1637,7 +1691,7 @@ def analyze_with_sonnet(
     kwargs: Dict[str, Any] = {
         "model": SONNET_MODEL,
         "max_tokens": 4096,
-        "system": _system_with_ephemeral_cache(SONNET_STOCK_ANALYSIS_SYSTEM),
+        "system": _STATIC_CACHED_SYSTEM_BLOCKS["sonnet_stock"],
         "messages": [
             {
                 "role": "user",
@@ -1682,7 +1736,7 @@ def portfolio_recommendations_with_sonnet(client: Anthropic, holdings_analysis: 
         client,
         model=SONNET_MODEL,
         max_tokens=2000,
-        system=_system_with_ephemeral_cache(SONNET_PORTFOLIO_SYSTEM),
+        system=_STATIC_CACHED_SYSTEM_BLOCKS["sonnet_portfolio"],
         messages=[
             {"role": "user", "content": json.dumps(user_payload, default=str)}
         ],
@@ -1771,6 +1825,7 @@ def build_rebalancing_comparison(
 
 def run_full_analysis_pipeline(
     client: Anthropic,
+    sb_client: Any | None,
     holdings: List[Dict[str, Any]],
     scoring_weights_run: Dict[str, float],
     *,
@@ -1792,37 +1847,111 @@ def run_full_analysis_pipeline(
     prog = st.progress(0.0) if show_progress else None
 
     for idx, h in enumerate(holdings):
-        ticker = h["ticker"]
-        if show_progress and status_placeholder is not None:
-            status_placeholder.info(f"Analyzing {ticker} ({idx + 1}/{len(holdings)})...")
-        raw = get_stock_raw_data(
-            yfinance_lookup_symbol(ticker),
-            display_ticker=ticker,
-        )
-        normalized = normalize_stock_data(raw)
-        analysis, web_summaries = analyze_with_sonnet(
-            client,
-            normalized,
-            h["quantity"],
-            scoring_weights_run,
-        )
-        if idx < len(holdings) - 1:
-            time.sleep(PER_STOCK_ANALYSIS_GAP_SEC)
-        normalized_map[ticker] = normalized
-        analysis_map[ticker] = analysis
-        research_by_ticker[ticker] = web_summaries
-        all_stock_records.append(
-            {
-                "ticker": ticker,
-                "quantity": h["quantity"],
-                "normalized": normalized,
-                "analysis": analysis,
+        try:
+            ticker = h["ticker"]
+            if show_progress and status_placeholder is not None:
+                status_placeholder.info(f"Analyzing {ticker} ({idx + 1}/{len(holdings)})...")
+            yf_symbol = yfinance_lookup_symbol(ticker)
+            cached_row = fetch_cached_stock_analysis(sb_client, ticker, max_age_days=14)
+            if isinstance(cached_row, dict) and isinstance(cached_row.get("full_result"), dict):
+                cached_full = cached_row.get("full_result") or {}
+                normalized = dict(cached_full.get("normalized") or {})
+                analysis = dict(cached_full.get("analysis") or {})
+                web_summaries = list(cached_full.get("web_summaries") or [])
+                live_px = get_live_price_refresh_snapshot(yf_symbol)
+                px = dict(normalized.get("price_snapshot") or {})
+                px["current_price"] = live_px.get("current_price")
+                px["fifty_two_week_high"] = live_px.get("fifty_two_week_high")
+                px["fifty_two_week_low"] = live_px.get("fifty_two_week_low")
+                normalized["price_snapshot"] = px
+                normalized["_cache_meta"] = {
+                    "from_cache": True,
+                    "analyzed_at": str(cached_row.get("analyzed_at") or ""),
+                }
+            else:
+                raw = get_stock_raw_data(
+                    yf_symbol,
+                    display_ticker=ticker,
+                )
+                normalized = normalize_stock_data(raw)
+                analysis, web_summaries = analyze_with_sonnet(
+                    client,
+                    normalized,
+                    h["quantity"],
+                    scoring_weights_run,
+                )
+                normalized["_cache_meta"] = {"from_cache": False}
+                print(f"DEBUG CACHE SAVE ATTEMPT: ticker={ticker}, sb_client is None: {sb_client is None}", flush=True)
+                try:
+                    save_stock_analysis_cache(
+                        sb_client,
+                        ticker=ticker,
+                        full_result={
+                            "normalized": normalized,
+                            "analysis": analysis,
+                            "web_summaries": web_summaries,
+                        },
+                        composite_score=_as_float(analysis.get("composite_score_10")),
+                        action=str(analysis.get("action") or ""),
+                    )
+                    print(f"DEBUG CACHE SAVE SUCCESS: {ticker}", flush=True)
+                    print(f"DEBUG CACHE SAVE DONE: {ticker}", flush=True)
+                    time.sleep(3)
+                except Exception as e:
+                    print(f"DEBUG CACHE SAVE FAILED: {ticker} error: {e}", flush=True)
+            if idx < len(holdings) - 1:
+                time.sleep(PER_STOCK_ANALYSIS_GAP_SEC)
+            normalized_map[ticker] = normalized
+            analysis_map[ticker] = analysis
+            research_by_ticker[ticker] = web_summaries
+            all_stock_records.append(
+                {
+                    "ticker": ticker,
+                    "quantity": h["quantity"],
+                    "normalized": normalized,
+                    "analysis": analysis,
+                }
+            )
+            if on_stock_complete is not None:
+                on_stock_complete(idx + 1, ticker, analysis)
+            if prog is not None:
+                prog.progress((idx + 1) / len(holdings))
+        except Exception as e:
+            print(f"Stock analysis failed: ticker={h.get('ticker', '?')} error: {e}", flush=True)
+            ft = str(h.get("ticker", "")).upper().strip() or "?"
+            failed_analysis: Dict[str, Any] = {
+                "composite_score_10": 5.0,
+                "action": "Hold",
+                "_analysis_failed": True,
+                "failure_reason": str(e),
             }
-        )
-        if on_stock_complete is not None:
-            on_stock_complete(idx + 1, ticker, analysis)
-        if prog is not None:
-            prog.progress((idx + 1) / len(holdings))
+            failed_normalized: Dict[str, Any] = {
+                "ticker": ft,
+                "price_snapshot": {},
+                "analyst_consensus": {
+                    "buy_count": 0,
+                    "hold_count": 0,
+                    "sell_count": 0,
+                    "sources": [],
+                },
+                "options_sentiment": {},
+            }
+            normalized_map[ft] = failed_normalized
+            analysis_map[ft] = failed_analysis
+            research_by_ticker[ft] = []
+            all_stock_records.append(
+                {
+                    "ticker": ft,
+                    "quantity": h.get("quantity", 0),
+                    "normalized": failed_normalized,
+                    "analysis": failed_analysis,
+                }
+            )
+            if on_stock_complete is not None:
+                on_stock_complete(idx + 1, ft, failed_analysis)
+            if prog is not None:
+                prog.progress((idx + 1) / len(holdings))
+            continue
 
     portfolio_ai = portfolio_recommendations_with_sonnet(client, all_stock_records)
     if show_progress and status_placeholder is not None:
@@ -1886,8 +2015,32 @@ def run_app():
         """,
         unsafe_allow_html=True,
     )
-    user_id = get_or_create_user_id()
     sb_client = get_supabase_client_singleton()
+    user_id = st.session_state.get("user_id")
+
+    if not user_id:
+        st.subheader("Sign in")
+        login_email = st.text_input(
+            "Email",
+            key="login_email",
+            placeholder="you@example.com",
+        ).strip()
+        if st.button("Continue", key="login_continue"):
+            if not login_email or not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", login_email):
+                st.error("Enter a valid email address.")
+            elif sb_client is None:
+                st.error("Supabase is required for email login. Configure SUPABASE_URL and SUPABASE_KEY.")
+            else:
+                resolved_user_id = get_or_create_user_by_email(sb_client, login_email)
+                if not resolved_user_id:
+                    st.error("Could not sign in with Supabase. Check users table access.")
+                else:
+                    st.session_state["user_id"] = resolved_user_id
+                    st.session_state["user_email"] = login_email.lower()
+                    st.rerun()
+        st.stop()
+
+    user_id = str(st.session_state.get("user_id"))
 
     with st.sidebar:
         st.checkbox(
@@ -1975,6 +2128,7 @@ def run_app():
             _allocation_df,
         ) = run_full_analysis_pipeline(
             client,
+            sb_client,
             holdings_batch,
             scoring_weights_run,
             show_progress=False,
@@ -2114,6 +2268,7 @@ def run_app():
                 allocation_df,
             ) = run_full_analysis_pipeline(
                 client,
+                sb_client,
                 holdings,
                 scoring_weights_run,
                 show_progress=True,
@@ -2227,6 +2382,11 @@ def run_app():
             web_sum = results.get("research_by_ticker", {}).get(ticker, [])
 
             st.markdown(f"### {ticker}")
+            cache_meta = normalized.get("_cache_meta") if isinstance(normalized, dict) else {}
+            if isinstance(cache_meta, dict) and cache_meta.get("from_cache"):
+                cached_at = str(cache_meta.get("analyzed_at") or "").strip()
+                stamp = cached_at if cached_at else "recent date"
+                st.caption(f"AI analysis cached from {stamp}. Price refreshed live.")
             px = normalized.get("price_snapshot", {})
             c1, c2, c3 = st.columns(3)
             c1.metric("Current Price", fmt_two_dec(px.get("current_price"), prefix="$"))
@@ -2360,13 +2520,17 @@ def run_app():
                 st.caption("Yahoo / broker sources: " + ", ".join(sources))
 
             opt = normalized.get("options_sentiment", {})
+            chain_unavail = bool(opt.get("options_chain_unavailable"))
             cp_ratio = _as_float(opt.get("call_put_open_interest_ratio"))
             iv_raw = _as_float(opt.get("implied_volatility"))
             nearest = opt.get("nearest_expiry")
             short_pct = _as_float(normalized.get("short_interest_pct_float"))
 
             st.markdown("**Call / put open interest ratio**")
-            st.markdown(interpret_call_put_oi_ratio(cp_ratio))
+            if chain_unavail:
+                st.markdown("Options data unavailable for this ticker")
+            else:
+                st.markdown(interpret_call_put_oi_ratio(cp_ratio))
 
             st.markdown("**Implied volatility (nearest expiry chain)**")
             st.caption(
@@ -2382,9 +2546,11 @@ def run_app():
 
             st.markdown("**Short interest (% of float)**")
             st.markdown(interpret_short_interest_pct(short_pct))
+            oi_ratio_disp = "N/A" if chain_unavail else fmt_two_dec(cp_ratio)
+            iv_disp = "N/A" if chain_unavail else fmt_two_dec(iv_raw)
             st.caption(
-                f"Raw metrics — OI ratio: {fmt_two_dec(cp_ratio)} | "
-                f"IV: {fmt_two_dec(iv_raw)} | "
+                f"Raw metrics — OI ratio: {oi_ratio_disp} | "
+                f"IV: {iv_disp} | "
                 f"Short: {fmt_two_dec(short_pct, suffix=' %')}"
             )
 

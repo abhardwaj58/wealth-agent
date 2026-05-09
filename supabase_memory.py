@@ -1,45 +1,53 @@
-# SQL to run in Supabase SQL Editor:
-# ------------------------------------------------------------
-# -- Enable gen_random_uuid() (usually already enabled on Supabase)
-# create extension if not exists pgcrypto;
-#
-# create table if not exists public.saved_portfolio (
-#   user_id text primary key,
-#   tickers_json jsonb not null default '[]'::jsonb,
-#   updated_at timestamptz not null default now()
-# );
-#
-# create table if not exists public.portfolio_runs (
-#   id uuid primary key default gen_random_uuid(),
-#   user_id text not null,
-#   run_timestamp timestamptz not null default now(),
-#   holdings jsonb not null,
-#   results_summary jsonb not null,
-#   weights_used jsonb not null
-# );
-#
-# create index if not exists portfolio_runs_user_ts_idx
-#   on public.portfolio_runs (user_id, run_timestamp desc);
-# ------------------------------------------------------------
-
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
-from uuid import uuid4
 
 import httpx
 import streamlit as st
 
 
-def get_or_create_user_id() -> str:
-    if "user_id" not in st.session_state:
-        st.session_state["user_id"] = str(uuid4())
-    return str(st.session_state["user_id"])
+def get_or_create_user_by_email(client: Optional[httpx.Client], email: str) -> Optional[str]:
+    if client is None:
+        return None
+    email_norm = str(email or "").strip().lower()
+    if not email_norm:
+        return None
+    try:
+        resp = client.get(
+            "/users",
+            params={
+                "select": "id,email",
+                "email": f"eq.{email_norm}",
+                "limit": 1,
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json() or []
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            uid = data[0].get("id")
+            return str(uid) if uid else None
+    except Exception:
+        pass
+    try:
+        resp = client.post(
+            "/users",
+            params={"on_conflict": "email"},
+            json={"email": email_norm},
+            headers={"Prefer": "resolution=merge-duplicates,return=representation"},
+        )
+        resp.raise_for_status()
+        data = resp.json() or []
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            uid = data[0].get("id")
+            return str(uid) if uid else None
+    except Exception:
+        return None
+    return None
 
 
 def get_supabase_client_singleton() -> Optional[httpx.Client]:
-    if "supabase_client" in st.session_state:
+    if "supabase_client" in st.session_state and st.session_state["supabase_client"] is not None:
         return st.session_state["supabase_client"]
     try:
         supabase_url = str(st.secrets.get("SUPABASE_URL", "")).strip()
@@ -160,7 +168,6 @@ def upsert_portfolio_run_snapshot(
     results_summary: List[Dict[str, Any]],
     weights_used: Dict[str, float],
 ) -> None:
-    """Upsert an in-flight run snapshot so partial progress is durable."""
     if client is None:
         return
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -212,3 +219,66 @@ def fetch_recent_runs(client: Optional[httpx.Client], user_id: str, limit: int =
         return data if isinstance(data, list) else []
     except Exception:
         return []
+
+
+def fetch_cached_stock_analysis(
+    client: Optional[httpx.Client],
+    ticker: str,
+    *,
+    max_age_days: int = 14,
+) -> Optional[Dict[str, Any]]:
+    if client is None:
+        return None
+    t = str(ticker or "").upper().strip()
+    if not t:
+        return None
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).isoformat()
+    try:
+        resp = client.get(
+            "/stock_cache",
+            params={
+                "select": "id,ticker,analyzed_at,full_result,composite_score,action",
+                "ticker": f"eq.{t}",
+                "analyzed_at": f"gt.{cutoff}",
+                "order": "analyzed_at.desc",
+                "limit": 1,
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json() or []
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            return data[0]
+    except Exception:
+        return None
+    return None
+
+
+def save_stock_analysis_cache(
+    client: Optional[httpx.Client],
+    *,
+    ticker: str,
+    full_result: Dict[str, Any],
+    composite_score: Optional[float],
+    action: str,
+) -> None:
+    if client is None:
+        return
+    t = str(ticker or "").upper().strip()
+    if not t:
+        return
+    payload = {
+        "ticker": t,
+        "analyzed_at": datetime.now(timezone.utc).isoformat(),
+        "full_result": full_result,
+        "composite_score": composite_score,
+        "action": action,
+    }
+    try:
+        client.post(
+            "/stock_cache",
+            json=payload,
+            headers={"Prefer": "return=minimal"},
+        ).raise_for_status()
+    except Exception as e:
+        print(f"SUPABASE CACHE SAVE ERROR: {e}")
+        return
