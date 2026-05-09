@@ -1069,6 +1069,35 @@ def reconcile_stock_analysis(parsed: Dict[str, Any], scoring_weights: Dict[str, 
     parsed["action"] = composite_to_action(comp)
 
 
+def _format_cached_date_label(raw_iso: str) -> str:
+    s = str(raw_iso or "").strip()
+    if not s:
+        return ""
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return f"{dt.strftime('%b')} {dt.day}, {dt.year}"
+    except Exception:
+        return ""
+
+
+def _recompute_results_with_weights(
+    results_obj: Dict[str, Any],
+    scoring_weights: Dict[str, float],
+) -> Dict[str, Any]:
+    analysis_map = dict(results_obj.get("analysis_map") or {})
+    for ticker, analysis in analysis_map.items():
+        if not isinstance(analysis, dict):
+            analysis = {}
+            analysis_map[ticker] = analysis
+        reconcile_stock_analysis(analysis, scoring_weights)
+    updated = dict(results_obj)
+    updated["analysis_map"] = analysis_map
+    holdings = list(updated.get("holdings") or [])
+    normalized_map = dict(updated.get("normalized_map") or {})
+    updated["allocation_df"] = compute_allocation(holdings, normalized_map)
+    return updated
+
+
 def grouped_research_by_tier(
     summaries: List[Dict[str, Any]],
 ) -> List[tuple[str, List[Dict[str, Any]]]]:
@@ -2015,7 +2044,11 @@ def run_app():
         """,
         unsafe_allow_html=True,
     )
-    sb_client = get_supabase_client_singleton()
+    sb_client = st.session_state.get("sb_client")
+    if sb_client is None:
+        sb_client = get_supabase_client_singleton()
+        if sb_client is not None:
+            st.session_state["sb_client"] = sb_client
     user_id = st.session_state.get("user_id")
 
     if not user_id:
@@ -2037,6 +2070,7 @@ def run_app():
                 else:
                     st.session_state["user_id"] = resolved_user_id
                     st.session_state["user_email"] = login_email.lower()
+                    st.session_state["sb_client"] = sb_client
                     st.rerun()
         st.stop()
 
@@ -2074,10 +2108,13 @@ def run_app():
         )
         st.divider()
         st.subheader("Scoring Weights")
+        if "scoring_weights" not in st.session_state:
+            st.session_state["scoring_weights"] = DEFAULT_SCORING_WEIGHTS.copy()
+        saved_weights = dict(st.session_state.get("scoring_weights") or DEFAULT_SCORING_WEIGHTS)
         for weight_key, label in WEIGHT_SLIDER_DEFINITIONS:
             sk = f"wrel_{weight_key}"
             if sk not in st.session_state:
-                st.session_state[sk] = int(round(DEFAULT_SCORING_WEIGHTS[weight_key] * 100))
+                st.session_state[sk] = int(round(saved_weights.get(weight_key, 0.0) * 100))
             st.slider(label, min_value=0, max_value=100, step=1, key=sk)
         rel_vals = [
             float(st.session_state.get(f"wrel_{k}", 0.0)) for k, _ in WEIGHT_SLIDER_DEFINITIONS
@@ -2091,8 +2128,17 @@ def run_app():
                 k: rel_vals[i] / rel_sum
                 for i, (k, _) in enumerate(WEIGHT_SLIDER_DEFINITIONS)
             }
-        st.session_state["scoring_weights"] = scoring_weights_live
         st.caption(f"Normalized total: **{sum(scoring_weights_live.values()) * 100:.2f}%**")
+        if st.button("Apply New Weights", key="apply_new_weights"):
+            st.session_state["scoring_weights"] = scoring_weights_live
+            if "results" in st.session_state:
+                st.session_state["results"] = _recompute_results_with_weights(
+                    dict(st.session_state["results"]),
+                    scoring_weights_live,
+                )
+                st.session_state["weights_recalculated_notice"] = True
+            else:
+                st.session_state["weights_recalculated_notice"] = False
 
     client = get_claude_client()
 
@@ -2218,6 +2264,7 @@ def run_app():
         if not holdings:
             st.error("Please add at least one valid holding.")
             st.stop()
+        st.session_state["weights_recalculated_notice"] = False
         manual_run_id = str(uuid4())
         live_weights_used = {
             **(st.session_state.get("scoring_weights") or DEFAULT_SCORING_WEIGHTS),
@@ -2352,6 +2399,8 @@ def run_app():
         if not has_results:
             st.caption("No run results yet.")
         st.subheader("Allocation")
+        if st.session_state.get("weights_recalculated_notice"):
+            st.caption("Scores recalculated with updated weights")
         alloc = results["allocation_df"]
         st.dataframe(alloc, use_container_width=True)
         if not alloc.empty:
@@ -2384,9 +2433,11 @@ def run_app():
             st.markdown(f"### {ticker}")
             cache_meta = normalized.get("_cache_meta") if isinstance(normalized, dict) else {}
             if isinstance(cache_meta, dict) and cache_meta.get("from_cache"):
-                cached_at = str(cache_meta.get("analyzed_at") or "").strip()
-                stamp = cached_at if cached_at else "recent date"
-                st.caption(f"AI analysis cached from {stamp}. Price refreshed live.")
+                stamp = _format_cached_date_label(str(cache_meta.get("analyzed_at") or ""))
+                if stamp:
+                    st.caption(
+                        f"Analysis cached on {stamp}. Price refreshed live. Shared analysis, your quantity is private."
+                    )
             px = normalized.get("price_snapshot", {})
             c1, c2, c3 = st.columns(3)
             c1.metric("Current Price", fmt_two_dec(px.get("current_price"), prefix="$"))
