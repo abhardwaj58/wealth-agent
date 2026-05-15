@@ -467,7 +467,7 @@ ANTHROPIC_500_RETRY_WAIT_SEC = 10.0
 ANTHROPIC_500_MAX_RETRIES = 3  # retries after a 500; total attempts = MAX_RETRIES + 1
 
 # Pause after each per-stock Sonnet analysis before the next holding (not after the last).
-PER_STOCK_ANALYSIS_GAP_SEC = 10.0
+PER_STOCK_ANALYSIS_GAP_SEC = 30.0
 
 # Scoring weights keys (decimals sum to 1.0 for Sonnet).
 DEFAULT_SCORING_WEIGHTS: Dict[str, float] = {
@@ -494,7 +494,7 @@ HAIKU_SEARCH_HIT_SUMMARY_MAX_TOKENS = 4000
 MAX_WEB_SEARCH_HITS_PER_ROUND = 20
 MAX_SUMMARIES_PER_TARGETED_QUERY = 5
 MAX_PORTFOLIO_SEARCH_HITS_TO_SUMMARIZE = 15
-MAX_HAIKU_WEB_SEARCH_CALLS_PER_STOCK = 8
+MAX_HAIKU_WEB_SEARCH_CALLS_PER_STOCK = 5
 DEBUG_LOG_FILE = Path(__file__).resolve().parent / "debug_log.txt"
 
 
@@ -810,6 +810,8 @@ def build_web_research_summaries_for_stock(
     for query in stock_targeted_search_queries(ticker, sector, market_cap):
         if search_calls_made >= MAX_HAIKU_WEB_SEARCH_CALLS_PER_STOCK:
             break
+        if search_calls_made > 0:
+            time.sleep(2)
         hits = haiku_web_search_for_stock(client, ticker, sector, query)
         search_calls_made += 1
         tier3_count = 0
