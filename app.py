@@ -1070,12 +1070,16 @@ def reconcile_stock_analysis(parsed: Dict[str, Any], scoring_weights: Dict[str, 
 
 
 def _format_cached_date_label(raw_iso: str) -> str:
+    """Format cache timestamp as MM.DD.YYYY (Pacific) for UI disclaimer."""
     s = str(raw_iso or "").strip()
     if not s:
         return ""
     try:
         dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        return f"{dt.strftime('%b')} {dt.day}, {dt.year}"
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+        dt_la = dt.astimezone(ZoneInfo("America/Los_Angeles"))
+        return dt_la.strftime("%m.%d.%Y")
     except Exception:
         return ""
 
@@ -1882,8 +1886,17 @@ def run_full_analysis_pipeline(
                 status_placeholder.info(f"Analyzing {ticker} ({idx + 1}/{len(holdings)})...")
             yf_symbol = yfinance_lookup_symbol(ticker)
             cached_row = fetch_cached_stock_analysis(sb_client, ticker, max_age_days=14)
-            if isinstance(cached_row, dict) and isinstance(cached_row.get("full_result"), dict):
-                cached_full = cached_row.get("full_result") or {}
+            cached_full: Dict[str, Any] | None = None
+            if isinstance(cached_row, dict):
+                fr = cached_row.get("full_result")
+                if isinstance(fr, str):
+                    try:
+                        fr = json.loads(fr)
+                    except json.JSONDecodeError:
+                        fr = None
+                if isinstance(fr, dict) and fr:
+                    cached_full = fr
+            if cached_full is not None:
                 normalized = dict(cached_full.get("normalized") or {})
                 analysis = dict(cached_full.get("analysis") or {})
                 web_summaries = list(cached_full.get("web_summaries") or [])
@@ -1897,6 +1910,12 @@ def run_full_analysis_pipeline(
                     "from_cache": True,
                     "analyzed_at": str(cached_row.get("analyzed_at") or ""),
                 }
+                try:
+                    st.session_state.setdefault("stock_cache_save_reports", []).append(
+                        {"ticker": ticker, "saved": False, "from_cache": True, "error": ""}
+                    )
+                except Exception:
+                    pass
             else:
                 raw = get_stock_raw_data(
                     yf_symbol,
@@ -1910,26 +1929,39 @@ def run_full_analysis_pipeline(
                     scoring_weights_run,
                 )
                 normalized["_cache_meta"] = {"from_cache": False}
-                print(f"DEBUG CACHE SAVE ATTEMPT: ticker={ticker}, sb_client is None: {sb_client is None}", flush=True)
+                cache_err = save_stock_analysis_cache(
+                    sb_client,
+                    ticker=ticker,
+                    full_result={
+                        "normalized": normalized,
+                        "analysis": analysis,
+                        "web_summaries": web_summaries,
+                    },
+                    composite_score=_as_float(analysis.get("composite_score_10")),
+                    action=str(analysis.get("action") or ""),
+                )
+                if cache_err:
+                    warn_msg = f"Could not save stock cache for {ticker}: {cache_err}"
+                    print(warn_msg, flush=True)
+                    if status_placeholder is not None:
+                        status_placeholder.warning(warn_msg)
+                    else:
+                        st.warning(warn_msg)
                 try:
-                    save_stock_analysis_cache(
-                        sb_client,
-                        ticker=ticker,
-                        full_result={
-                            "normalized": normalized,
-                            "analysis": analysis,
-                            "web_summaries": web_summaries,
-                        },
-                        composite_score=_as_float(analysis.get("composite_score_10")),
-                        action=str(analysis.get("action") or ""),
+                    st.session_state.setdefault("stock_cache_save_reports", []).append(
+                        {
+                            "ticker": ticker,
+                            "saved": cache_err is None,
+                            "from_cache": False,
+                            "error": cache_err or "",
+                        }
                     )
-                    print(f"DEBUG CACHE SAVE SUCCESS: {ticker}", flush=True)
-                    print(f"DEBUG CACHE SAVE DONE: {ticker}", flush=True)
-                    time.sleep(3)
-                except Exception as e:
-                    print(f"DEBUG CACHE SAVE FAILED: {ticker} error: {e}", flush=True)
+                except Exception:
+                    pass
             if idx < len(holdings) - 1:
-                time.sleep(PER_STOCK_ANALYSIS_GAP_SEC)
+                meta = normalized.get("_cache_meta") if isinstance(normalized, dict) else {}
+                if not (isinstance(meta, dict) and meta.get("from_cache")):
+                    time.sleep(PER_STOCK_ANALYSIS_GAP_SEC)
             normalized_map[ticker] = normalized
             analysis_map[ticker] = analysis
             research_by_ticker[ticker] = web_summaries
@@ -1947,6 +1979,17 @@ def run_full_analysis_pipeline(
                 prog.progress((idx + 1) / len(holdings))
         except Exception as e:
             print(f"Stock analysis failed: ticker={h.get('ticker', '?')} error: {e}", flush=True)
+            try:
+                st.session_state.setdefault("stock_cache_save_reports", []).append(
+                    {
+                        "ticker": str(h.get("ticker", "") or "").upper(),
+                        "saved": False,
+                        "from_cache": False,
+                        "error": f"analysis_failed: {e}",
+                    }
+                )
+            except Exception:
+                pass
             ft = str(h.get("ticker", "")).upper().strip() or "?"
             failed_analysis: Dict[str, Any] = {
                 "composite_score_10": 5.0,
@@ -2143,6 +2186,7 @@ def run_app():
     client = get_claude_client()
 
     def _run_scheduled_batch() -> None:
+        st.session_state["stock_cache_save_reports"] = []
         holdings_batch = load_saved_portfolio(sb_client, user_id)
         if not holdings_batch:
             return
@@ -2264,6 +2308,7 @@ def run_app():
         if not holdings:
             st.error("Please add at least one valid holding.")
             st.stop()
+        st.session_state["stock_cache_save_reports"] = []
         st.session_state["weights_recalculated_notice"] = False
         manual_run_id = str(uuid4())
         live_weights_used = {
@@ -2340,6 +2385,24 @@ def run_app():
                 "allocation_df": allocation_df,
                 "portfolio_ai": portfolio_ai,
             }
+        reports = st.session_state.get("stock_cache_save_reports") or []
+        if reports:
+            saved = [r["ticker"] for r in reports if r.get("saved")]
+            from_cache = [r["ticker"] for r in reports if r.get("from_cache")]
+            failed = [(r["ticker"], r.get("error", "")) for r in reports if r.get("error")]
+            if failed:
+                st.error(
+                    "Stock cache (`stock_cache`) had save errors — rows may be missing in Supabase. "
+                    + "; ".join(f"{t}: {err}" for t, err in failed)
+                )
+            elif saved:
+                st.success(
+                    f"Saved {len(saved)} fresh analysis(es) to Supabase `stock_cache`: {', '.join(saved)}"
+                )
+            if from_cache:
+                st.info(
+                    f"Served from cache (no new research) for: {', '.join(from_cache)}"
+                )
     has_results = "results" in st.session_state
     if not has_results:
         st.info("Run the analysis to view insights.")

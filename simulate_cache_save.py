@@ -49,13 +49,16 @@ def main() -> int:
     }
 
     print(f"Saving cache row for {TEST_TICKER} (same path as app)...", flush=True)
-    save_stock_analysis_cache(
+    err = save_stock_analysis_cache(
         client,
         ticker=TEST_TICKER,
         full_result=dummy_full_result,
         composite_score=7.25,
         action="Buy",
     )
+    if err:
+        print(f"FAIL: save_stock_analysis_cache: {err}", flush=True)
+        return 4
 
     row = fetch_cached_stock_analysis(client, TEST_TICKER, max_age_days=14)
     if not row:

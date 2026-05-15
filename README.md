@@ -63,10 +63,12 @@ Notes:
 
 ## Supabase SQL Setup
 
-Use the SQL block at the top of `supabase_memory.py` in your Supabase SQL editor to create:
-- `saved_portfolio`
-- `portfolio_runs`
-- supporting index
+Use the SQL comment block at the top of `supabase_memory.py` in your Supabase SQL editor to create:
+- `stock_cache` (14-day per-ticker analysis cache)
+- `saved_portfolio` and `portfolio_runs` (memory + run history)
+- supporting indexes
+
+Per-ticker behavior: within **14 days** of `analyzed_at`, the app loads `full_result` from `stock_cache`, skips new web research and full Sonnet re-run for that ticker, refreshes **live price** and 52-week high/low via yfinance, and shows a disclaimer with the cached date (**MM.DD.YYYY** Pacific).
 
 ## Run Locally
 
