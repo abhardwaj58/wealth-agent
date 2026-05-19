@@ -29,9 +29,11 @@ from supabase_memory import (
 
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 SONNET_MODEL = "claude-sonnet-4-20250514"
+MARKET_US = "US Markets"
+MARKET_INDIA = "India (NSE)"
 
 # Estimated token count: ~1500 (intentionally >1024 for Anthropic prompt cache threshold).
-SONNET_STOCK_ANALYSIS_SYSTEM = """You are a senior equity research and portfolio recommendation assistant.
+_SONNET_STOCK_SYSTEM_PREFIX = """You are a senior equity research and portfolio recommendation assistant.
 You analyze exactly one symbol per request, using only structured JSON user input.
 
 PRIMARY OBJECTIVE
@@ -46,8 +48,12 @@ User input includes:
   analyst_consensus, institutional_positioning, forward_revenue_visibility,
   valuation_vs_historical_pe, macro_and_sector_factors, options_and_short_interest
 - data object with normalized market, fundamentals, and analyst fields
-- institutional_positioning data
-- web_research_summaries list of source summaries. Each summary may include source_tier and source_weight.
+"""
+
+_SONNET_STOCK_US_INSTITUTIONAL_DATA_CONTRACT = """- institutional_positioning data
+"""
+
+_SONNET_STOCK_SYSTEM_MID = """- web_research_summaries list of source summaries. Each summary may include source_tier and source_weight.
 
 HARD CONSTRAINTS
 - You cannot browse or use tools.
@@ -73,7 +79,20 @@ Anchor interpretation:
 - 9-10: exceptional
 Avoid extreme scores unless evidence is strong and multi-sourced.
 
-FACTOR 1: analyst_score (analyst_consensus)
+"""
+
+_SONNET_STOCK_INDIA_MARKET_FRAMING = """You are analyzing an Indian stock listed on NSE or BSE.
+Replace all SEC/EDGAR references with BSE/NSE filing references.
+Replace institutional holders with FII, DII, and promoter holding percentages.
+Promoter holding above 50% indicates founder-controlled company, which is common and generally positive in India.
+Replace US analyst consensus with Indian brokerage coverage from firms like Motilal Oswal, Kotak Securities, ICICI Direct, HDFC Securities, Edelweiss, Axis Securities.
+Government contracts and policy tailwinds are especially important for Indian infrastructure, defense, railways, and power sectors.
+Evaluate FII inflow or outflow trends as a proxy for foreign institutional sentiment.
+All price targets should be in INR unless the stock is dual-listed.
+
+"""
+
+_SONNET_STOCK_US_ANALYST_INSTITUTIONAL_FACTOR_FRAMING = """FACTOR 1: analyst_score (analyst_consensus)
 - Inputs: buy/hold/sell counts, trend indications, reputable research commentary.
 - Higher when analyst stance is consistently constructive with coherent rationale.
 - Lower when downgrades dominate, revisions trend negative, or outlook uncertainty rises.
@@ -83,7 +102,9 @@ FACTOR 2: institutional_score (institutional_positioning)
 - Higher with stable/high-quality institutional sponsorship and positive ownership trends.
 - Lower with sharp ownership deterioration, weak sponsorship, or churn concerns.
 
-FACTOR 3: revenue_score (forward_revenue_visibility)
+"""
+
+_SONNET_STOCK_SYSTEM_SUFFIX = """FACTOR 3: revenue_score (forward_revenue_visibility)
 - Inputs: guidance quality, demand durability, backlog/order visibility, catalyst clarity.
 - Higher when forward growth path has credible, specific support.
 - Lower when revenue outlook is opaque, cyclically fragile, or heavily assumption-driven.
@@ -162,6 +183,31 @@ OUTPUT SCHEMA (STRICT)
   "action": "Strong Buy" | "Buy" | "Hold" | "Reduce" | "Sell",
   "thesis": "<short synthesis string>"
 }"""
+
+SONNET_STOCK_ANALYSIS_SYSTEM = (
+    _SONNET_STOCK_SYSTEM_PREFIX
+    + _SONNET_STOCK_US_INSTITUTIONAL_DATA_CONTRACT
+    + _SONNET_STOCK_SYSTEM_MID
+    + _SONNET_STOCK_US_ANALYST_INSTITUTIONAL_FACTOR_FRAMING
+    + _SONNET_STOCK_SYSTEM_SUFFIX
+)
+
+
+def sonnet_stock_system_blocks_for_market(is_india: bool) -> List[Dict[str, Any]]:
+    """Assemble Sonnet stock system prompt; US framing sections are conditional."""
+    parts = [_SONNET_STOCK_SYSTEM_PREFIX]
+    if not is_india:
+        parts.append(_SONNET_STOCK_US_INSTITUTIONAL_DATA_CONTRACT)
+    else:
+        parts.append(_SONNET_STOCK_INDIA_MARKET_FRAMING)
+    parts.append(_SONNET_STOCK_SYSTEM_MID)
+    if not is_india:
+        parts.append(_SONNET_STOCK_US_ANALYST_INSTITUTIONAL_FACTOR_FRAMING)
+    else:
+        pass
+    parts.append(_SONNET_STOCK_SYSTEM_SUFFIX)
+    return _cached_instruction_system_blocks("".join(parts))
+
 
 # Estimated token count: ~1350 (intentionally >1024 for Anthropic prompt cache threshold).
 SONNET_PORTFOLIO_SYSTEM = """You are a portfolio strategist producing concise, actionable guidance.
@@ -560,51 +606,65 @@ def stock_targeted_search_queries(
     ticker: str,
     sector: str | None,
     market_cap: float | None,
+    *,
+    is_india: bool = False,
 ) -> List[str]:
     _ = sector or "Unknown sector"
     t = ticker.strip().upper()
     cap = _as_float(market_cap)
 
-    large_cap_queries = [
-        f"{t} SEC EDGAR 10-K latest filing",
-        f"{t} SEC EDGAR latest 10-Q filing",
-        f"{t} SEC EDGAR latest 8-K material events",
-        f"{t} earnings call transcript latest quarter",
-        f"{t} earnings guidance management commentary latest",
-        f"{t} Goldman Sachs Morgan Stanley analyst rating latest",
-        f"{t} JPMorgan BofA Barclays price target latest",
-        f"{t} 13F institutional holdings latest quarter",
-        f"{t} BlackRock Vanguard 13F position latest",
-        f"{t} insider buying selling SEC Form 4 latest",
-        f"{t} Bloomberg company news latest",
-        f"{t} Reuters company news latest",
-    ]
+    if not is_india:
+        large_cap_queries = [
+            f"{t} SEC EDGAR 10-K latest filing",
+            f"{t} SEC EDGAR latest 10-Q filing",
+            f"{t} SEC EDGAR latest 8-K material events",
+            f"{t} earnings call transcript latest quarter",
+            f"{t} earnings guidance management commentary latest",
+            f"{t} Goldman Sachs Morgan Stanley analyst rating latest",
+            f"{t} JPMorgan BofA Barclays price target latest",
+            f"{t} 13F institutional holdings latest quarter",
+            f"{t} BlackRock Vanguard 13F position latest",
+            f"{t} insider buying selling SEC Form 4 latest",
+            f"{t} Bloomberg company news latest",
+            f"{t} Reuters company news latest",
+        ]
 
-    mid_cap_queries = [
-        f"{t} SEC EDGAR 10-K latest filing",
-        f"{t} SEC EDGAR latest 10-Q filing",
-        f"{t} earnings call transcript latest quarter",
-        f"{t} earnings guidance management commentary latest",
-        f"{t} Goldman Sachs Morgan Stanley analyst rating latest",
-        f"{t} JPMorgan BofA Barclays price target latest",
-        f"{t} insider buying selling SEC Form 4 latest",
-        f"{t} Reuters company news latest",
-    ]
+        mid_cap_queries = [
+            f"{t} SEC EDGAR 10-K latest filing",
+            f"{t} SEC EDGAR latest 10-Q filing",
+            f"{t} earnings call transcript latest quarter",
+            f"{t} earnings guidance management commentary latest",
+            f"{t} Goldman Sachs Morgan Stanley analyst rating latest",
+            f"{t} JPMorgan BofA Barclays price target latest",
+            f"{t} insider buying selling SEC Form 4 latest",
+            f"{t} Reuters company news latest",
+        ]
 
-    small_cap_queries = [
-        f"{t} SEC EDGAR 10-K latest filing",
-        f"{t} SEC EDGAR latest 10-Q filing",
-        f"{t} earnings call transcript latest quarter",
-        f"{t} earnings guidance management commentary latest",
-        f"{t} analyst rating latest",
-        f"{t} analyst price target latest",
-    ]
+        small_cap_queries = [
+            f"{t} SEC EDGAR 10-K latest filing",
+            f"{t} SEC EDGAR latest 10-Q filing",
+            f"{t} earnings call transcript latest quarter",
+            f"{t} earnings guidance management commentary latest",
+            f"{t} analyst rating latest",
+            f"{t} analyst price target latest",
+        ]
 
-    if cap is not None and cap < 5_000_000_000:
-        return small_cap_queries
-    if cap is not None and cap < 10_000_000_000:
-        return mid_cap_queries
-    return large_cap_queries
+        if cap is not None and cap < 5_000_000_000:
+            return small_cap_queries
+        if cap is not None and cap < 10_000_000_000:
+            return mid_cap_queries
+        return large_cap_queries
+    else:
+        queries: List[str] = []
+        queries.append(f"{t} BSE NSE shareholding pattern FII DII promoter holding 2025 2026")
+        queries.append(f"{t} government contract order win ministry India announcement")
+        queries.append(f"{t} analyst target price Motilal Oswal Kotak ICICI HDFC Edelweiss 2026")
+        queries.append(f"{t} BSE filing board meeting quarterly results announcement")
+        queries.append(f"{t} India sector policy budget government regulation 2026")
+        queries.append(f"{t} partnership acquisition deal India 2026")
+        queries.append(f"{t} bulk deal block deal institutional investor NSE India")
+        queries.append(f"{t} earnings revenue profit guidance India 2026")
+        return queries
 
 
 def extract_web_search_hits_from_response(response: Any) -> List[Dict[str, Any]]:
@@ -801,13 +861,18 @@ def sentence_targets_for_source_weight(source_weight: float) -> tuple[int, int]:
 
 
 def build_web_research_summaries_for_stock(
-    client: Anthropic, ticker: str, sector: str | None, market_cap: float | None
+    client: Anthropic,
+    ticker: str,
+    sector: str | None,
+    market_cap: float | None,
+    *,
+    is_india: bool = False,
 ) -> List[Dict[str, Any]]:
     """Stock web research retrieval + tier-batched summarization."""
     collected_hits: List[Dict[str, Any]] = []
     ctx = f"Targeted diligence for {ticker.upper()}"
     search_calls_made = 0
-    for query in stock_targeted_search_queries(ticker, sector, market_cap):
+    for query in stock_targeted_search_queries(ticker, sector, market_cap, is_india=is_india):
         if search_calls_made >= MAX_HAIKU_WEB_SEARCH_CALLS_PER_STOCK:
             break
         if search_calls_made > 0:
@@ -1128,14 +1193,34 @@ CRYPTO_BASE_SYMBOLS_USD = frozenset({
     "UNI", "VET", "WAVES", "WLD", "XLM", "XMR", "XRP", "XTZ", "YFI", "ZEC", "ZIL",
 })
 
+def _is_india_market() -> bool:
+    try:
+        return str(st.session_state.get("market") or MARKET_US) == MARKET_INDIA
+    except Exception:
+        return False
+
+
+def normalize_holding_ticker(ticker: str) -> str:
+    """Display/cache ticker: strip .NS/.BO when India market is selected."""
+    t = str(ticker or "").strip().upper()
+    if not t or not _is_india_market():
+        return t
+    if t.endswith(".NS"):
+        return t[:-3]
+    if t.endswith(".BO"):
+        return t[:-3]
+    return t
+
 
 def yfinance_lookup_symbol(display_ticker: str) -> str:
-    """Map UI ticker to Yahoo Finance symbol; append -USD for known crypto bases without a suffix."""
-    t = display_ticker.strip().upper()
+    """Map UI ticker to Yahoo Finance symbol; append -USD for crypto or .NS for India NSE."""
+    t = normalize_holding_ticker(display_ticker)
     if not t or "-" in t:
         return t
     if t in CRYPTO_BASE_SYMBOLS_USD:
         return f"{t}-USD"
+    if _is_india_market() and not (t.endswith(".NS") or t.endswith(".BO")):
+        return f"{t}.NS"
     return t
 
 
@@ -1212,7 +1297,9 @@ def extract_holdings_from_image(client: Anthropic, image_b64: str, media_type: s
         ticker = str(row.get("ticker", "")).upper().strip()
         qty = row.get("quantity", 0)
         if ticker and isinstance(qty, (int, float)):
-            cleaned.append({"ticker": ticker, "quantity": float(qty)})
+            cleaned.append(
+                {"ticker": normalize_holding_ticker(ticker), "quantity": float(qty)}
+            )
     return cleaned
 
 
@@ -1228,7 +1315,9 @@ def parse_manual_holdings(raw: str) -> List[Dict[str, Any]]:
             except ValueError:
                 continue
             if ticker and quantity > 0:
-                holdings.append({"ticker": ticker, "quantity": quantity})
+                holdings.append(
+                    {"ticker": normalize_holding_ticker(ticker), "quantity": quantity}
+                )
     return holdings
 
 
@@ -1704,6 +1793,8 @@ def analyze_with_sonnet(
     normalized_payload: Dict[str, Any],
     quantity: float,
     scoring_weights: Dict[str, float],
+    *,
+    is_india: bool = False,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     data = normalized_payload_for_sonnet(normalized_payload)
     ticker = str(data.get("ticker") or normalized_payload.get("ticker") or "")
@@ -1713,20 +1804,30 @@ def analyze_with_sonnet(
         "top_institutional_holders": [],
         "major_holders": [],
     }
-    summaries = build_web_research_summaries_for_stock(client, ticker, sector, market_cap)
+    summaries = build_web_research_summaries_for_stock(
+        client, ticker, sector, market_cap, is_india=is_india
+    )
 
     user_payload = {
         "holding_quantity": quantity,
         "scoring_weights": scoring_weights,
         "data": data,
-        "institutional_positioning": inst,
         "web_research_summaries": summaries,
     }
+    if not is_india:
+        user_payload["institutional_positioning"] = inst
+    else:
+        user_payload["institutional_positioning"] = {
+            "promoter_holding_pct": normalized_payload.get("promoter_holding_pct"),
+            "fii_holding_pct": normalized_payload.get("fii_holding_pct"),
+            "dii_holding_pct": normalized_payload.get("dii_holding_pct"),
+            "top_shareholders": normalized_payload.get("top_shareholders", []),
+        }
 
     kwargs: Dict[str, Any] = {
         "model": SONNET_MODEL,
         "max_tokens": 4096,
-        "system": _STATIC_CACHED_SYSTEM_BLOCKS["sonnet_stock"],
+        "system": sonnet_stock_system_blocks_for_market(is_india),
         "messages": [
             {
                 "role": "user",
@@ -1864,6 +1965,7 @@ def run_full_analysis_pipeline(
     holdings: List[Dict[str, Any]],
     scoring_weights_run: Dict[str, float],
     *,
+    market: str = MARKET_US,
     show_progress: bool,
     status_placeholder: Any | None = None,
     on_stock_complete: Callable[[int, str, Dict[str, Any]], None] | None = None,
@@ -1880,6 +1982,7 @@ def run_full_analysis_pipeline(
     research_by_ticker: Dict[str, List[Dict[str, Any]]] = {}
     all_stock_records: List[Dict[str, Any]] = []
     prog = st.progress(0.0) if show_progress else None
+    is_india = market == MARKET_INDIA
 
     for idx, h in enumerate(holdings):
         try:
@@ -1929,6 +2032,7 @@ def run_full_analysis_pipeline(
                     normalized,
                     h["quantity"],
                     scoring_weights_run,
+                    is_india=is_india,
                 )
                 normalized["_cache_meta"] = {"from_cache": False}
                 cache_err = save_stock_analysis_cache(
@@ -2021,10 +2125,16 @@ def run_full_analysis_pipeline(
                     "analysis": failed_analysis,
                 }
             )
-            if on_stock_complete is not None:
-                on_stock_complete(idx + 1, ft, failed_analysis)
-            if prog is not None:
-                prog.progress((idx + 1) / len(holdings))
+            try:
+                if on_stock_complete is not None:
+                    on_stock_complete(idx + 1, ft, failed_analysis)
+            except Exception:
+                pass
+            try:
+                if prog is not None:
+                    prog.progress((idx + 1) / len(holdings))
+            except Exception:
+                pass
             continue
 
     portfolio_ai = portfolio_recommendations_with_sonnet(client, all_stock_records)
@@ -2189,7 +2299,10 @@ def run_app():
 
     def _run_scheduled_batch() -> None:
         st.session_state["stock_cache_save_reports"] = []
-        holdings_batch = load_saved_portfolio(sb_client, user_id)
+        holdings_batch = [
+            {**h, "ticker": normalize_holding_ticker(h["ticker"])}
+            for h in load_saved_portfolio(sb_client, user_id)
+        ]
         if not holdings_batch:
             return
         batch_run_id = str(uuid4())
@@ -2223,6 +2336,7 @@ def run_app():
             sb_client,
             holdings_batch,
             scoring_weights_run,
+            market=st.session_state.get("market", MARKET_US),
             show_progress=False,
             status_placeholder=None,
             on_stock_complete=_save_batch_partial,
@@ -2256,6 +2370,8 @@ def run_app():
         st.session_state["manual_holdings_parsed_rows"] = (
             parsed if parsed else [{"ticker": "", "quantity": 0.0}]
         )
+        if parsed:
+            st.session_state["manual_holdings_input"] = format_holdings_as_manual_input(parsed)
         st.session_state["holdings_editor_version"] = int(
             st.session_state.get("holdings_editor_version", 0)
         ) + 1
@@ -2272,12 +2388,22 @@ def run_app():
         _sync_holdings_editor_from_manual_input()
 
     st.subheader("Portfolio Input")
+    if "market" not in st.session_state:
+        st.session_state["market"] = MARKET_US
+    st.radio(
+        "Market",
+        options=[MARKET_US, MARKET_INDIA],
+        horizontal=True,
+        key="market",
+    )
     st.text_area(
         "Manual input (format: TICKER:QTY, TICKER:QTY)",
         placeholder="AAPL:12, MSFT:8, NVDA:5",
         key="manual_holdings_input",
         on_change=_sync_holdings_editor_from_manual_input,
     )
+    if st.session_state.get("market") == MARKET_INDIA:
+        st.caption("Enter tickers without .NS suffix, e.g. RELIANCE, INFY, TCS")
     apply_col, _ = st.columns([1, 6])
     with apply_col:
         if st.button("✔ Apply", key="apply_manual_holdings_input"):
@@ -2301,7 +2427,7 @@ def run_app():
     edited = st.data_editor(edit_df, num_rows="dynamic", use_container_width=True, key=editor_key)
     holdings = []
     for _, row in edited.iterrows():
-        ticker = str(row.get("ticker", "")).upper().strip()
+        ticker = normalize_holding_ticker(str(row.get("ticker", "")))
         qty = row.get("quantity", 0)
         if ticker and isinstance(qty, (int, float)) and float(qty) > 0:
             holdings.append({"ticker": ticker, "quantity": float(qty)})
@@ -2365,6 +2491,7 @@ def run_app():
                 sb_client,
                 holdings,
                 scoring_weights_run,
+                market=st.session_state.get("market", MARKET_US),
                 show_progress=True,
                 status_placeholder=status_box,
                 on_stock_complete=_save_and_render_partial,
